@@ -3,16 +3,17 @@ import { readFileSync } from "fs";
 import path from "path";
 
 async function main() {
+  // 1) RPC + signer (Hardhat node default)
   const rpcUrl = "http://127.0.0.1:8545";
   const provider = new ethers.JsonRpcProvider(rpcUrl);
 
-  const privateKey = process.env.DEPLOYER_PRIVATE_KEY as string;
-  if (!privateKey) throw new Error("Missing DEPLOYER_PRIVATE_KEY");
+  // Hardhat node exposes accounts; signer(0) = first account (issuer)
+  const signer = await provider.getSigner(0);
 
-  const wallet = new ethers.Wallet(privateKey, provider);
+  // 2) Contract address (PUT YOUR LATEST DEPLOYED ADDRESS HERE)
+  const contractAddress = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512";
 
-  const contractAddress = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
-
+  // 3) Load ABI from artifacts
   const artifactPath = path.join(
     process.cwd(),
     "artifacts",
@@ -20,20 +21,25 @@ async function main() {
     "CertificateRegistry.sol",
     "CertificateRegistry.json"
   );
-
   const artifact = JSON.parse(readFileSync(artifactPath, "utf8"));
-  const contract = new ethers.Contract(contractAddress, artifact.abi, wallet);
 
-  const certId = "CERT-001";
+  // 4) Connect contract with signer (so we can send tx)
+  const registry = new ethers.Contract(contractAddress, artifact.abi, signer);
 
-  const tx = await contract.revokeCertificate(certId);
+  // 5) Choose certId to revoke
+  const certId = "CERT-003";
+
+  console.log(`Revoking: ${certId} on ${contractAddress}`);
+
+  // 6) Send tx
+  const tx = await registry.revokeCertificate(certId);
+  console.log("Tx sent:", tx.hash);
+
   const receipt = await tx.wait();
-
-  console.log("Revoked certId:", certId);
-  console.log("Tx hash:", receipt.hash);
+  console.log("✅ Revoked. Block:", receipt.blockNumber);
 }
 
 main().catch((e) => {
-  console.error(e);
+  console.error("❌ revoke-test failed:", e);
   process.exit(1);
 });

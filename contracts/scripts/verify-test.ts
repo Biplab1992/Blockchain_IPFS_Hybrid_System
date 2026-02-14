@@ -12,7 +12,8 @@ async function main() {
   const rpcUrl = "http://127.0.0.1:8545";
   const provider = new ethers.JsonRpcProvider(rpcUrl);
 
-  const contractAddress = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
+  // ✅ put your latest deployed address here
+  const contractAddress = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512";
 
   const artifactPath = path.join(
     process.cwd(),
@@ -22,24 +23,19 @@ async function main() {
     "CertificateRegistry.json"
   );
   const artifact = JSON.parse(readFileSync(artifactPath, "utf8"));
+
   const contract = new ethers.Contract(contractAddress, artifact.abi, provider);
 
-  const certId = "CERT-003";
+  // ✅ verify this cert
+  const certId = "CERT-004";
 
-  // 1) Read on-chain data
-  const result = await contract.getCertificate(certId);
-
-  const cid: string = result[0];
-  const onChainHash: string = result[1];
-  const issuer: string = result[2];
-  const issuedAt: bigint = result[3];
-  const revoked: boolean = Boolean(result[4]);
-  const exists: boolean = Boolean(result[5]);
+  const [cid, onChainHash, issuer, issuedAt, revoked, exists] =
+    await contract.getCertificate(certId);
 
   console.log("certId   :", certId);
   console.log("cid      :", cid);
   console.log("issuer   :", issuer);
-  console.log("issuedAt :", issuedAt.toString());
+  console.log("issuedAt :", Number(issuedAt));
   console.log("revoked  :", revoked);
   console.log("exists   :", exists);
 
@@ -47,32 +43,19 @@ async function main() {
     console.log("❌ Certificate does not exist");
     return;
   }
+
   if (revoked) {
-    console.log("❌ Certificate is revoked");
+    console.log("❌ Certificate is REVOKED");
     return;
   }
 
-  // 2) Fetch file bytes via backend (avoids public gateway blocking)
+  // Fetch bytes via your backend (make sure backend is running)
   const url = `http://localhost:5050/api/fetch/${cid}`;
-  const response = await axios.get(url, {
-    responseType: "arraybuffer",
-    validateStatus: () => true, // we handle status manually
-  });
+  const resp = await axios.get(url, { responseType: "arraybuffer" });
+  const fileBuf = Buffer.from(resp.data);
 
-  if (response.status !== 200) {
-    // Try to print error text if any
-    const text = Buffer.from(response.data).toString("utf8");
-    console.log("❌ Backend fetch failed. HTTP:", response.status);
-    console.log("Response:", text.slice(0, 300));
-    return;
-  }
+  const computedHash = sha256Hex(fileBuf);
 
-  const fileBuffer = Buffer.from(response.data);
-
-  // 3) Hash downloaded bytes
-  const computedHash = sha256Hex(fileBuffer);
-
-  // 4) Compare
   console.log("On-chain hash :", onChainHash);
   console.log("Computed hash:", computedHash);
 
@@ -84,6 +67,6 @@ async function main() {
 }
 
 main().catch((e) => {
-  console.error("Fatal error:", e);
+  console.error("❌ verify-test failed:", e);
   process.exit(1);
 });

@@ -13,8 +13,8 @@ async function main() {
   // ====== SETTINGS ======
   const rpcUrl = "http://127.0.0.1:8545";
   const backendUrl = "http://localhost:5050";
-  const contractAddress = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
-  const certId = "CERT-003"; // change each run to avoid duplicate id issues
+  const contractAddress = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512";
+  const certId = "CERT-004"; // change each run to avoid duplicate id issues
   const localFilePath = path.join(process.cwd(), "..", "test", "cert.bin"); 
   // If your cert.bin is elsewhere, adjust this path
 
