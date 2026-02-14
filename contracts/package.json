@@ -12,7 +12,6 @@
   "devDependencies": {
     "@nomicfoundation/hardhat-ethers": "^4.0.4",
     "@nomicfoundation/hardhat-ignition": "^3.0.7",
-    "@nomicfoundation/hardhat-toolbox-mocha-ethers": "^3.0.2",
     "@types/chai": "^4.3.20",
     "@types/chai-as-promised": "^8.0.2",
     "@types/mocha": "^10.0.10",
@@ -24,5 +23,8 @@
     "mocha": "^11.7.5",
     "typescript": "~5.8.0"
   },
-  "type": "module"
+  "type": "module",
+  "dependencies": {
+    "axios": "^1.13.5"
+  }
 }

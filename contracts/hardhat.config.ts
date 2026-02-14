@@ -1,45 +1,17 @@
-import "@nomicfoundation/hardhat-ethers";
-import hardhatToolboxMochaEthersPlugin from "@nomicfoundation/hardhat-toolbox-mocha-ethers";
-import { configVariable, defineConfig } from "hardhat/config";
+// contracts/hardhat.config.ts
+import { HardhatUserConfig } from "hardhat/config";
 
-export default defineConfig({
-  plugins: [hardhatToolboxMochaEthersPlugin],
-  solidity: {
-    profiles: {
-      default: {
-        version: "0.8.28",
-      },
-      production: {
-        version: "0.8.28",
-        settings: {
-          optimizer: {
-            enabled: true,
-            runs: 200,
-          },
-        },
-      },
-    },
-  },
+// This line is the key fix 👇 (it injects `ethers` into Hardhat runtime)
+import "@nomicfoundation/hardhat-ethers";
+
+const config: HardhatUserConfig = {
+  solidity: "0.8.20",
   networks: {
     localhost: {
-      type: "http",
       url: "http://127.0.0.1:8545",
-      chainType: "l1",
-    },
-
-    hardhatMainnet: {
-      type: "edr-simulated",
-      chainType: "l1",
-    },
-    hardhatOp: {
-      type: "edr-simulated",
-      chainType: "op",
-    },
-    sepolia: {
-      type: "http",
-      chainType: "l1",
-      url: configVariable("SEPOLIA_RPC_URL"),
-      accounts: [configVariable("SEPOLIA_PRIVATE_KEY")],
+      chainId: 31337,
     },
   },
-});
+};
+
+export default config;
