@@ -1,5 +1,5 @@
-// scripts/issue-test.ts
-import { ethers } from "ethers";
+import { network } from "hardhat";
+import { loadDeployment } from "./utils/deployments";
 import axios from "axios";
 import crypto from "crypto";
 import { readFileSync } from "fs";
@@ -10,26 +10,21 @@ function sha256Hex(buf: Buffer) {
 }
 
 async function main() {
-  // ====== SETTINGS ======
-  const rpcUrl = "http://127.0.0.1:8545";
   const backendUrl = "http://localhost:5050";
-  const contractAddress = "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512";
-  const certId = "CERT-004"; // change each run to avoid duplicate id issues
-  const localFilePath = path.join(process.cwd(), "..", "test", "cert.bin"); 
-  // If your cert.bin is elsewhere, adjust this path
+  const { ethers, networkName } = await network.connect();
 
-  // ====== 1) Load file bytes and hash locally ======
+  const contractAddress = loadDeployment(networkName, "CertificateRegistry");
+  const contract = await ethers.getContractAt("CertificateRegistry", contractAddress);
+  const certId = "CERT-006";
+  const localFilePath = path.join(process.cwd(), "..", "test", "cert.bin");
+
   const fileBytes = readFileSync(localFilePath);
-  const fileHashHex = sha256Hex(fileBytes); // no 0x prefix yet
+  const fileHashHex = sha256Hex(fileBytes);
 
   console.log("File:", localFilePath);
   console.log("Original size:", fileBytes.length, "bytes");
   console.log("Local SHA256:", fileHashHex);
 
-  // ====== 2) Upload via backend -> Pinata (returns cid + fileHash) ======
-  const form = new FormData();
-  // Node 18+ has global FormData + Blob, but in some setups it doesn't.
-  // So we do a simple axios multipart fallback:
   const multipart = await import("form-data");
   const fd = new multipart.default();
   fd.append("file", fileBytes, { filename: path.basename(localFilePath) });
@@ -45,24 +40,7 @@ async function main() {
   console.log("CID:", cid);
   console.log("Backend SHA256:", backendHash);
 
-  // ====== 3) Connect to contract and issue ======
-  const provider = new ethers.JsonRpcProvider(rpcUrl);
-  const signer = await provider.getSigner(0);
-
-  const artifactPath = path.join(
-    process.cwd(),
-    "artifacts",
-    "contracts",
-    "CertificateRegistry.sol",
-    "CertificateRegistry.json"
-  );
-  const artifact = JSON.parse(readFileSync(artifactPath, "utf8"));
-
-  const contract = new ethers.Contract(contractAddress, artifact.abi, signer);
-
-  // Store 0x-prefixed hash on-chain
   const onChainHash = ("0x" + backendHash) as `0x${string}`;
-
   const tx = await contract.issueCertificate(certId, cid, onChainHash);
   const receipt = await tx.wait();
 
@@ -71,6 +49,6 @@ async function main() {
 }
 
 main().catch((e) => {
-  console.error("❌ issue-test failed:", e);
+  console.error("issue-test failed:", e);
   process.exit(1);
 });

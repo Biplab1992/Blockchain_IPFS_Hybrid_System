@@ -1,29 +1,15 @@
-import { ethers } from "ethers";
-import { readFileSync } from "fs";
-import path from "path";
+import { network } from "hardhat";
+import { loadDeployment } from "./utils/deployments";
 
 async function main() {
-  const rpcUrl = "http://127.0.0.1:8545";
-  const provider = new ethers.JsonRpcProvider(rpcUrl);
+  const { ethers, networkName } = await network.connect();
 
-  const contractAddress = "0x5FbDB2315678afecb367f032d93F642f64180aa3";
+  const contractAddress = loadDeployment(networkName, "CertificateRegistry");
+  const contract = await ethers.getContractAt("CertificateRegistry", contractAddress);
 
-  const artifactPath = path.join(
-    process.cwd(),
-    "artifacts",
-    "contracts",
-    "CertificateRegistry.sol",
-    "CertificateRegistry.json"
-  );
-
-  const artifact = JSON.parse(readFileSync(artifactPath, "utf8"));
-  const contract = new ethers.Contract(contractAddress, artifact.abi, provider);
-
-  const certId = "CERT-002";
-
+  const certId = "CERT-006";
   const result = await contract.getCertificate(certId);
 
-  // result may be tuple/array-like depending on ABI
   console.log("getCertificate(", certId, ") =>");
   console.log(result);
 }

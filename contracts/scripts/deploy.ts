@@ -1,37 +1,20 @@
-// contracts/scripts/deploy.ts
-import { ethers } from "ethers";
-import { readFileSync } from "fs";
-import path from "path";
+import { network } from "hardhat";
+import { saveDeployment } from "./utils/deployments";
 
 async function main() {
-  const rpcUrl = "http://127.0.0.1:8545";
-  const provider = new ethers.JsonRpcProvider(rpcUrl);
+  const { ethers, networkName } = await network.connect();
 
-  // Hardhat node has unlocked accounts -> signer(0) works
-  const signer = await provider.getSigner(0);
-
-  // Adjust names if your contract/filename differs
-  const artifactPath = path.join(
-    process.cwd(),
-    "artifacts",
-    "contracts",
-    "CertificateRegistry.sol",
-    "CertificateRegistry.json"
-  );
-
-  const artifact = JSON.parse(readFileSync(artifactPath, "utf8"));
-  const abi = artifact.abi;
-  const bytecode = artifact.bytecode;
-
-  const factory = new ethers.ContractFactory(abi, bytecode, signer);
-
+  const factory = await ethers.getContractFactory("CertificateRegistry");
   const contract = await factory.deploy();
   await contract.waitForDeployment();
 
-  console.log("✅ CertificateRegistry deployed to:", await contract.getAddress());
+  const address = await contract.getAddress();
+  console.log(`CertificateRegistry deployed to: ${address}`);
+
+  saveDeployment(networkName, "CertificateRegistry", address);
 }
 
 main().catch((e) => {
   console.error(e);
-  process.exitCode = 1;
+  process.exit(1);
 });
