@@ -24,7 +24,7 @@ async function main() {
   const artifact = JSON.parse(readFileSync(artifactPath, "utf8"));
   const contract = new ethers.Contract(contractAddress, artifact.abi, provider);
 
-  const certId = "CERT-002";
+  const certId = "CERT-003";
 
   // 1) Read on-chain data
   const result = await contract.getCertificate(certId);
