@@ -34,14 +34,34 @@ async function main() {
     maxBodyLength: Infinity,
   });
 
-  const cid: string = pinRes.data.cid;
+  const fileCid: string = pinRes.data.cid;
   const backendHash: string = pinRes.data.fileHash;
 
-  console.log("CID:", cid);
+  console.log("File CID:", fileCid);
   console.log("Backend SHA256:", backendHash);
 
+  const metadata = {
+    certId,
+    fileCid,
+    fileHash: "0x" + backendHash,
+    version: 1,
+    replacesCertId: "",
+    title: "Test Certificate",
+  };
+  const metadataBytes = Buffer.from(JSON.stringify(metadata), "utf8");
+  const metadataFd = new multipart.default();
+  metadataFd.append("file", metadataBytes, { filename: `${certId}.metadata.json` });
+
+  const metadataPinRes = await axios.post(`${backendUrl}/api/pin`, metadataFd, {
+    headers: metadataFd.getHeaders(),
+    maxBodyLength: Infinity,
+  });
+
+  const metadataCid: string = metadataPinRes.data.cid;
+  console.log("Metadata CID:", metadataCid);
+
   const onChainHash = ("0x" + backendHash) as `0x${string}`;
-  const tx = await contract.issueCertificate(certId, cid, onChainHash);
+  const tx = await contract.issueCertificate(certId, metadataCid, fileCid, onChainHash, 1, "");
   const receipt = await tx.wait();
 
   console.log("Issued certId:", certId);

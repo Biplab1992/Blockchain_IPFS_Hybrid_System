@@ -15,12 +15,15 @@ async function main() {
 
   const certId = "CERT-006";
 
-  const [cid, onChainHash, issuer, issuedAt, revoked, exists] =
+  const [metadataCid, fileCidOnChain, onChainHash, issuer, version, replacesCertId, issuedAt, revoked, exists] =
     await contract.getCertificate(certId);
 
   console.log("certId   :", certId);
-  console.log("cid      :", cid);
+  console.log("metadata :", metadataCid);
+  console.log("fileCid  :", fileCidOnChain);
   console.log("issuer   :", issuer);
+  console.log("version  :", Number(version));
+  console.log("replaces :", replacesCertId);
   console.log("issuedAt :", Number(issuedAt));
   console.log("revoked  :", revoked);
   console.log("exists   :", exists);
@@ -35,9 +38,20 @@ async function main() {
     return;
   }
 
-  const url = `http://localhost:5050/api/fetch/${cid}`;
-  const resp = await axios.get(url, { responseType: "arraybuffer" });
-  const fileBuf = Buffer.from(resp.data);
+  const metadataUrl = `http://localhost:5050/api/fetch/${metadataCid}`;
+  const metadataResp = await axios.get(metadataUrl, { responseType: "arraybuffer" });
+  const metadataJson = JSON.parse(Buffer.from(metadataResp.data).toString("utf8")) as {
+    fileCid?: string;
+  };
+
+  const fileCid = metadataJson.fileCid || fileCidOnChain;
+  if (!fileCid) {
+    throw new Error("No fileCid found in metadata or on-chain record");
+  }
+
+  const fileUrl = `http://localhost:5050/api/fetch/${fileCid}`;
+  const fileResp = await axios.get(fileUrl, { responseType: "arraybuffer" });
+  const fileBuf = Buffer.from(fileResp.data);
 
   const computedHash = sha256Hex(fileBuf);
 
