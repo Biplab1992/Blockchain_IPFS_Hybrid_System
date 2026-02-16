@@ -1,17 +1,19 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, Navigate, Route, Routes } from "react-router-dom";
+import { BrowserProvider, Contract } from "ethers";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:5050";
-const TOKEN_KEY = "cert_demo_jwt";
-const ADDRESS_KEY = "cert_demo_wallet";
-const SITE_TITLE = "CertChain – Decentralized Academic Verification";
+const CONTRACT_ADDRESS = import.meta.env.VITE_CONTRACT_ADDRESS || "0x5FbDB2315678afecb367f032d93F642f64180aa3";
+const RPC_URL = import.meta.env.VITE_RPC_URL || "http://127.0.0.1:8545";
+const REQUIRED_CHAIN_ID = Number(import.meta.env.VITE_CHAIN_ID || 31337);
+const REQUIRED_CHAIN_ID_HEX = `0x${REQUIRED_CHAIN_ID.toString(16)}`;
+const SITE_TITLE = "CertChain - Decentralized Academic Verification";
 
-function getStoredAuth() {
-  return {
-    token: localStorage.getItem(TOKEN_KEY) || "",
-    address: localStorage.getItem(ADDRESS_KEY) || "",
-  };
-}
+const CONTRACT_ABI = [
+  "function issueCertificate(string certId, string metadataCid, string fileCid, bytes32 fileHash, uint256 version, string replacesCertId)",
+  "function revokeCertificate(string certId)",
+  "function setIssuer(address issuer, bool allowed)",
+];
 
 async function apiJson(url, options = {}) {
   const response = await fetch(url, options);
@@ -28,106 +30,165 @@ async function apiJson(url, options = {}) {
   if (!response.ok) {
     const parsedError = String(parsed.error || "").trim();
     const parsedMessage = String(parsed.message || "").trim();
-    const genericErrors = new Set([
-      "Issue failed",
-      "Revoke failed",
-      "Verification failed",
-      "Pinata upload failed",
-    ]);
-    const preferredMessage =
-      parsedMessage && (genericErrors.has(parsedError) || !parsedError)
-        ? parsedMessage
-        : parsedError || parsedMessage;
-    throw new Error(preferredMessage || `HTTP ${response.status}`);
+    throw new Error(parsedError || parsedMessage || `HTTP ${response.status}`);
   }
+
   return parsed;
 }
 
-function normalizeIssueErrorMessage(error) {
-  const raw = String(error?.message || error || "");
-  if (raw.toLowerCase().includes("certificate already exists")) {
-    return "Certificate already exists";
+async function ensureCorrectWalletNetwork() {
+  if (!window.ethereum) {
+    throw new Error("Wallet not found. Install MetaMask.");
   }
-  if (raw.toLowerCase().includes("could not decode result data")) {
-    return "Backend ABI mismatch with deployed contract. Redeploy contract, refresh deployments.json, then restart backend.";
+
+  try {
+    await window.ethereum.request({
+      method: "wallet_switchEthereumChain",
+      params: [{ chainId: REQUIRED_CHAIN_ID_HEX }],
+    });
+  } catch (switchError) {
+    if (switchError?.code === 4902) {
+      await window.ethereum.request({
+        method: "wallet_addEthereumChain",
+        params: [
+          {
+            chainId: REQUIRED_CHAIN_ID_HEX,
+            chainName: "Hardhat Local",
+            rpcUrls: [RPC_URL],
+            nativeCurrency: {
+              name: "Ether",
+              symbol: "ETH",
+              decimals: 18,
+            },
+          },
+        ],
+      });
+      return;
+    }
+    throw switchError;
   }
-  return raw || "Issue failed";
 }
 
-async function signInWithWallet() {
-  if (!window.ethereum) {
-    throw new Error("Wallet not found. Install MetaMask or another EVM wallet.");
+async function assertContractDeployed(provider) {
+  const code = await provider.getCode(CONTRACT_ADDRESS);
+  if (!code || code === "0x") {
+    throw new Error(
+      `No contract bytecode at ${CONTRACT_ADDRESS} on chain ${REQUIRED_CHAIN_ID}. Check VITE_CONTRACT_ADDRESS / network.`
+    );
   }
+}
 
-  const accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
-  const address = accounts?.[0];
-  if (!address) throw new Error("No wallet account selected.");
-
-  const nonceResp = await apiJson(
-    `${API_BASE}/api/auth/nonce?address=${encodeURIComponent(address)}`
+function BlockchainLogo() {
+  return (
+    <svg
+      className="brand-logo"
+      viewBox="0 0 72 72"
+      aria-hidden="true"
+    >
+      <defs>
+        <linearGradient id="logoGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stopColor="#00a7c7" />
+          <stop offset="100%" stopColor="#1f2b57" />
+        </linearGradient>
+      </defs>
+      <rect x="8" y="8" width="56" height="56" rx="16" fill="url(#logoGradient)" />
+      <circle cx="24" cy="24" r="5" fill="#ffffff" />
+      <circle cx="48" cy="24" r="5" fill="#ffffff" />
+      <circle cx="24" cy="48" r="5" fill="#ffffff" />
+      <circle cx="48" cy="48" r="5" fill="#ffffff" />
+      <path d="M24 24H48M24 24V48M48 24V48M24 48H48" stroke="#ffffff" strokeWidth="3" />
+      <rect x="31" y="31" width="10" height="10" rx="2" fill="#ffffff" />
+    </svg>
   );
-  const message = nonceResp.message;
-  const nonce = nonceResp.nonce;
-
-  const signature = await window.ethereum.request({
-    method: "personal_sign",
-    params: [message, address],
-  });
-
-  const verifyResp = await apiJson(`${API_BASE}/api/auth/verify`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ address, nonce, signature }),
-  });
-
-  const token = verifyResp.token;
-  localStorage.setItem(TOKEN_KEY, token);
-  localStorage.setItem(ADDRESS_KEY, address);
-  return { token, address };
 }
 
 function App() {
-  const [auth, setAuth] = useState(() => getStoredAuth());
+  const [walletAddress, setWalletAddress] = useState("");
+
   useEffect(() => {
     document.title = SITE_TITLE;
   }, []);
 
-  const isAuthenticated = useMemo(() => Boolean(auth.token), [auth.token]);
+  const isConnected = useMemo(() => Boolean(walletAddress), [walletAddress]);
 
-  function logout() {
-    localStorage.removeItem(TOKEN_KEY);
-    localStorage.removeItem(ADDRESS_KEY);
-    setAuth({ token: "", address: "" });
+  async function connectWallet() {
+    if (!window.ethereum) {
+      throw new Error("Wallet not found. Install MetaMask.");
+    }
+    await ensureCorrectWalletNetwork();
+    const provider = new BrowserProvider(window.ethereum);
+    const network = await provider.getNetwork();
+    if (Number(network.chainId) !== REQUIRED_CHAIN_ID) {
+      throw new Error(`Wrong network. Please switch to chainId ${REQUIRED_CHAIN_ID}.`);
+    }
+    const signer = await provider.getSigner();
+    const address = await signer.getAddress();
+    setWalletAddress(address);
+    return { provider, signer, address };
+  }
+
+  async function ensureWallet() {
+    if (!window.ethereum) {
+      throw new Error("Wallet not found. Install MetaMask.");
+    }
+    await ensureCorrectWalletNetwork();
+    const provider = new BrowserProvider(window.ethereum);
+    await provider.send("eth_requestAccounts", []);
+    const network = await provider.getNetwork();
+    if (Number(network.chainId) !== REQUIRED_CHAIN_ID) {
+      throw new Error(`Wrong network. Please switch to chainId ${REQUIRED_CHAIN_ID}.`);
+    }
+    await assertContractDeployed(provider);
+    const signer = await provider.getSigner();
+    const address = await signer.getAddress();
+    if (!walletAddress || walletAddress.toLowerCase() !== address.toLowerCase()) {
+      setWalletAddress(address);
+    }
+    return { provider, signer, address };
   }
 
   return (
     <div className="shell">
       <header className="topbar">
-        <div className="brand">{SITE_TITLE}</div>
-        <nav className="nav">
-          <Link to="/verify">Verify</Link>
-          <Link to="/issue">Issue</Link>
-        </nav>
-        <div className="auth-pill">
-          {isAuthenticated ? (
-            <>
-              <span>{auth.address.slice(0, 6)}...{auth.address.slice(-4)}</span>
-              <button onClick={logout}>Logout</button>
-            </>
-          ) : (
-            <button
-              onClick={async () => {
-                try {
-                  const nextAuth = await signInWithWallet();
-                  setAuth(nextAuth);
-                } catch (error) {
-                  alert(error.message || String(error));
-                }
-              }}
-            >
-              Wallet Sign-In
-            </button>
-          )}
+        <div className="brand-lockup">
+          <button
+            type="button"
+            className="logo-button"
+            onClick={() => window.location.reload()}
+            title="Refresh page"
+          >
+            <BlockchainLogo />
+          </button>
+          <div className="brand-text">
+            <div className="brand-main">CertChain</div>
+            <div className="brand-sub">Decentralized Academic Verification</div>
+          </div>
+        </div>
+        <div className="header-right">
+          <div className="auth-pill">
+            {isConnected ? (
+              <>
+                <span>{walletAddress.slice(0, 6)}...{walletAddress.slice(-4)}</span>
+                <button onClick={() => setWalletAddress("")}>Disconnect</button>
+              </>
+            ) : (
+              <button
+                onClick={async () => {
+                  try {
+                    await connectWallet();
+                  } catch (error) {
+                    alert(error.message || String(error));
+                  }
+                }}
+              >
+                Connect Wallet
+              </button>
+            )}
+          </div>
+          <nav className="nav">
+            <Link to="/verify">Verify</Link>
+            <Link to="/issue">Issue</Link>
+          </nav>
         </div>
       </header>
 
@@ -135,17 +196,14 @@ function App() {
         <Routes>
           <Route path="/" element={<Navigate to="/verify" replace />} />
           <Route path="/verify" element={<VerifyPage />} />
-          <Route
-            path="/issue"
-            element={<IssuePage auth={auth} onAuthChange={setAuth} />}
-          />
+          <Route path="/issue" element={<IssuePage ensureWallet={ensureWallet} />} />
         </Routes>
       </main>
     </div>
   );
 }
 
-function IssuePage({ auth, onAuthChange }) {
+function IssuePage({ ensureWallet }) {
   const [certId, setCertId] = useState("");
   const [title, setTitle] = useState("");
   const [recipient, setRecipient] = useState("");
@@ -155,17 +213,15 @@ function IssuePage({ auth, onAuthChange }) {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
+
   const [revokeCertId, setRevokeCertId] = useState("");
   const [revokeLoading, setRevokeLoading] = useState(false);
   const [revokeResult, setRevokeResult] = useState(null);
   const [revokeError, setRevokeError] = useState("");
-
-  async function ensureAuth() {
-    if (auth.token) return auth;
-    const nextAuth = await signInWithWallet();
-    onAuthChange(nextAuth);
-    return nextAuth;
-  }
+  const [issuerAddress, setIssuerAddress] = useState("");
+  const [issuerLoading, setIssuerLoading] = useState(false);
+  const [issuerResult, setIssuerResult] = useState(null);
+  const [issuerError, setIssuerError] = useState("");
 
   async function onSubmit(event) {
     event.preventDefault();
@@ -179,44 +235,47 @@ function IssuePage({ auth, onAuthChange }) {
 
     setLoading(true);
     try {
-      const currentAuth = await ensureAuth();
+      const { signer, address } = await ensureWallet();
 
       const form = new FormData();
       form.append("file", file);
+      form.append("certId", certId);
+      form.append("title", title);
+      form.append("recipient", recipient);
+      form.append("version", String(version));
+      form.append("replacesCertId", replacesCertId);
+
       const pinResp = await apiJson(`${API_BASE}/api/pin`, {
         method: "POST",
         body: form,
       });
 
-      const fileCid = pinResp.cid;
-      const fileHash = `0x${String(pinResp.fileHash || "").replace(/^0x/, "")}`;
+      const metadataCid = String(pinResp.metadataCid || "").trim();
+      const fileCid = String(pinResp.fileCid || pinResp.cid || "").trim();
+      const fileHash = String(pinResp.fileHash || "").trim();
+      if (!metadataCid || !fileCid || !/^0x[0-9a-fA-F]{64}$/.test(fileHash)) {
+        throw new Error("Pin response missing metadataCid/fileCid/fileHash");
+      }
 
-      const metadata = {
-        title,
-        recipient,
-        sourceFileName: file.name,
-        sourceFileType: file.type,
-      };
+      const contract = new Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
+      const tx = await contract.issueCertificate(
+        certId.trim(),
+        metadataCid,
+        fileCid,
+        fileHash,
+        BigInt(Number(version)),
+        replacesCertId.trim()
+      );
+      const receipt = await tx.wait();
 
-      const issueResp = await apiJson(`${API_BASE}/api/issue`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${currentAuth.token}`,
-        },
-        body: JSON.stringify({
-          certId,
-          fileCid,
-          fileHash,
-          version: Number(version),
-          replacesCertId,
-          metadata,
-        }),
+      setResult({
+        certId,
+        metadataCid,
+        txHash: receipt?.hash || tx.hash,
+        issuer: address,
       });
-
-      setResult(issueResp);
     } catch (submitError) {
-      setError(normalizeIssueErrorMessage(submitError));
+      setError(submitError.message || String(submitError));
     } finally {
       setLoading(false);
     }
@@ -234,18 +293,15 @@ function IssuePage({ auth, onAuthChange }) {
 
     setRevokeLoading(true);
     try {
-      const currentAuth = await ensureAuth();
-      const revokeResp = await apiJson(`${API_BASE}/api/revoke`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${currentAuth.token}`,
-        },
-        body: JSON.stringify({
-          certId: revokeCertId.trim(),
-        }),
+      const { signer, address } = await ensureWallet();
+      const contract = new Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
+      const tx = await contract.revokeCertificate(revokeCertId.trim());
+      const receipt = await tx.wait();
+      setRevokeResult({
+        certId: revokeCertId.trim(),
+        txHash: receipt?.hash || tx.hash,
+        issuer: address,
       });
-      setRevokeResult(revokeResp);
     } catch (submitError) {
       setRevokeError(submitError.message || String(submitError));
     } finally {
@@ -253,43 +309,59 @@ function IssuePage({ auth, onAuthChange }) {
     }
   }
 
+  async function onSetIssuer(allowed) {
+    setIssuerError("");
+    setIssuerResult(null);
+
+    if (!issuerAddress.trim()) {
+      setIssuerError("Enter issuer wallet address.");
+      return;
+    }
+
+    setIssuerLoading(true);
+    try {
+      const { signer } = await ensureWallet();
+      const contract = new Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
+      const tx = await contract.setIssuer(issuerAddress.trim(), allowed);
+      const receipt = await tx.wait();
+      setIssuerResult({
+        issuer: issuerAddress.trim(),
+        allowed,
+        txHash: receipt?.hash || tx.hash,
+      });
+    } catch (submitError) {
+      setIssuerError(submitError.message || String(submitError));
+    } finally {
+      setIssuerLoading(false);
+    }
+  }
+
   return (
     <section className="card">
       <h1>Issue Certificate</h1>
-      <p className="sub">Protected route. Wallet login + JWT required.</p>
+      <p className="sub">Wallet-native issue flow. Backend is used for IPFS pinning only.</p>
 
       <form className="form" onSubmit={onSubmit}>
         <label>
           Certificate ID
           <input value={certId} onChange={(e) => setCertId(e.target.value)} required />
         </label>
-
         <label>
           Title
           <input value={title} onChange={(e) => setTitle(e.target.value)} />
         </label>
-
         <label>
           Recipient
           <input value={recipient} onChange={(e) => setRecipient(e.target.value)} />
         </label>
-
         <label>
           Version
-          <input
-            type="number"
-            min={1}
-            value={version}
-            onChange={(e) => setVersion(e.target.value)}
-            required
-          />
+          <input type="number" min={1} value={version} onChange={(e) => setVersion(e.target.value)} required />
         </label>
-
         <label>
           Replaces Cert ID (for version {">"} 1)
           <input value={replacesCertId} onChange={(e) => setReplacesCertId(e.target.value)} />
         </label>
-
         <label>
           Upload PDF
           <input
@@ -318,8 +390,7 @@ function IssuePage({ auth, onAuthChange }) {
       <hr className="section-divider" />
 
       <h2>Revoke Certificate</h2>
-      <p className="sub">Protected route. Revoke by certificate ID.</p>
-
+      <p className="sub">Wallet-native revoke by certificate ID.</p>
       <form className="form" onSubmit={onRevoke}>
         <label>
           Certificate ID
@@ -338,6 +409,40 @@ function IssuePage({ auth, onAuthChange }) {
           <p><strong>txHash:</strong> {revokeResult.txHash}</p>
         </div>
       ) : null}
+
+      <hr className="section-divider" />
+
+      <h2>Issuer Admin Panel</h2>
+      <p className="sub">Owner-only action on contract: add/remove authorized issuers.</p>
+      <div className="form">
+        <label>
+          Issuer Wallet Address
+          <input value={issuerAddress} onChange={(e) => setIssuerAddress(e.target.value)} />
+        </label>
+        <div className="action-row">
+          <button type="button" disabled={issuerLoading} onClick={() => onSetIssuer(true)}>
+            {issuerLoading ? "Saving..." : "Add Issuer"}
+          </button>
+          <button
+            type="button"
+            className="revoke-button"
+            disabled={issuerLoading}
+            onClick={() => onSetIssuer(false)}
+          >
+            {issuerLoading ? "Saving..." : "Remove Issuer"}
+          </button>
+        </div>
+      </div>
+
+      {issuerError ? <p className="error">{issuerError}</p> : null}
+      {issuerResult ? (
+        <div className="result">
+          <h2>Issuer Updated</h2>
+          <p><strong>issuer:</strong> {issuerResult.issuer}</p>
+          <p><strong>allowed:</strong> {String(issuerResult.allowed)}</p>
+          <p><strong>txHash:</strong> {issuerResult.txHash}</p>
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -347,17 +452,27 @@ function VerifyPage() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState(null);
+  const [history, setHistory] = useState(null);
+  const [historyError, setHistoryError] = useState("");
 
   async function onSubmit(event) {
     event.preventDefault();
     setError("");
     setResult(null);
+    setHistory(null);
+    setHistoryError("");
     setLoading(true);
     try {
-      const verifyResp = await apiJson(
-        `${API_BASE}/api/verify/${encodeURIComponent(certId)}`
-      );
+      const encodedCertId = encodeURIComponent(certId);
+      const [verifyResp, historyResp] = await Promise.all([
+        apiJson(`${API_BASE}/api/verify/${encodedCertId}`),
+        apiJson(`${API_BASE}/api/certificates/${encodedCertId}/history`).catch((historyErr) => {
+          setHistoryError(historyErr.message || String(historyErr));
+          return null;
+        }),
+      ]);
       setResult(verifyResp);
+      setHistory(historyResp);
     } catch (verifyError) {
       setError(verifyError.message || String(verifyError));
     } finally {
@@ -397,16 +512,35 @@ function VerifyPage() {
           <p><strong>File CID:</strong> {result.fileCid}</p>
           <p><strong>Integrity Match:</strong> {String(result.integrityMatch)}</p>
           <p><strong>Revoked:</strong> {String(result.revoked)}</p>
-          <a
-            href={`${API_BASE}/api/fetch/${result.fileCid}`}
-            target="_blank"
-            rel="noreferrer"
-          >
+          <a href={`${API_BASE}/api/fetch/${result.fileCid}`} target="_blank" rel="noreferrer">
             Download File
           </a>
           <pre>{JSON.stringify(result.metadata || {}, null, 2)}</pre>
         </div>
       ) : null}
+
+      {history ? (
+        <div className="result chain-panel">
+          <h2>Version Chain</h2>
+          <p>
+            <strong>Root:</strong> {history.rootCertId} <strong>Length:</strong> {history.chainLength}
+          </p>
+          <div className="chain-row">
+            {history.chain.map((item, index) => (
+              <div key={item.certId} className="chain-item-wrap">
+                <div className={item.certId === certId ? "chain-item chain-item-active" : "chain-item"}>
+                  <div className="chain-id">{item.certId}</div>
+                  <div className="chain-meta">v{item.version}</div>
+                  <div className="chain-meta">{item.revoked ? "Revoked" : "Active"}</div>
+                </div>
+                {index < history.chain.length - 1 ? <span className="chain-arrow">{"->"}</span> : null}
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+
+      {historyError ? <p className="error">{historyError}</p> : null}
     </section>
   );
 }

@@ -86,9 +86,11 @@ const __dirname = path.dirname(__filename);
 const workspaceRoot = path.resolve(__dirname, "..", "..");
 
 const CERTIFICATE_REGISTRY_ABI = [
+  "function owner() view returns (address)",
   "function getCertificate(string certId) view returns (string metadataCid, string fileCid, bytes32 fileHash, address issuer, uint256 version, string replacesCertId, uint256 issuedAt, bool revoked, bool exists)",
   "function issueCertificate(string certId, string metadataCid, string fileCid, bytes32 fileHash, uint256 version, string replacesCertId)",
   "function revokeCertificate(string certId)",
+  "function setIssuer(address issuer, bool allowed)",
   "function authorizedIssuers(address issuer) view returns (bool)",
   "event CertificateIssued(string indexed certId, string cid, address indexed issuer, uint256 issuedAt)",
   "event CertificateRevoked(string indexed certId, address indexed issuer, uint256 revokedAt)",
@@ -470,6 +472,52 @@ async function ensureCertificateIndexFresh(): Promise<void> {
   await certificateIndexRebuildPromise;
 }
 
+function buildCertificateHistory(seedCertId: string): {
+  rootCertId: string;
+  chain: CertificateIndexEntry[];
+} | null {
+  const byCertId = certificateIndexCache;
+  const seed = byCertId.get(seedCertId);
+  if (!seed) return null;
+
+  const visited = new Set<string>();
+
+  // Walk backwards to root.
+  let root = seed;
+  while (root.replacesCertId) {
+    if (visited.has(root.certId)) break;
+    visited.add(root.certId);
+    const parent = byCertId.get(root.replacesCertId);
+    if (!parent) break;
+    root = parent;
+  }
+
+  // Walk forward root -> latest.
+  const chain: CertificateIndexEntry[] = [];
+  let cursor: CertificateIndexEntry | undefined = root;
+  const forwardVisited = new Set<string>();
+
+  while (cursor && !forwardVisited.has(cursor.certId)) {
+    const current: CertificateIndexEntry = cursor;
+    chain.push(current);
+    forwardVisited.add(current.certId);
+
+    const children: CertificateIndexEntry[] = Array.from(byCertId.values())
+      .filter((item) => item.replacesCertId === current.certId)
+      .sort((a, b) => {
+        if (a.version !== b.version) return a.version - b.version;
+        return a.issuedAt - b.issuedAt;
+      });
+
+    cursor = children[0];
+  }
+
+  return {
+    rootCertId: root.certId,
+    chain,
+  };
+}
+
 async function ensureAddressIsAuthorizedIssuer(address: string): Promise<boolean> {
   const contract = getReadOnlyContract();
   return (await contract.getFunction("authorizedIssuers").staticCall(address)) as boolean;
@@ -619,9 +667,42 @@ app.post("/api/pin", pinRateLimiter, upload.single("file"), async (req, res) => 
     if (!jwt) return res.status(500).json({ error: "PINATA_JWT not set" });
 
     const fileHash = sha256Hex(req.file.buffer);
-    const cid = await pinBufferToIpfs(req.file.buffer, req.file.originalname, jwt, req.file.originalname);
+    const fileCid = await pinBufferToIpfs(req.file.buffer, req.file.originalname, jwt, req.file.originalname);
 
-    return res.json({ cid, fileHash });
+    const certId = String(req.body?.certId || "").trim();
+    const title = String(req.body?.title || "").trim();
+    const recipient = String(req.body?.recipient || "").trim();
+    const replacesCertId = String(req.body?.replacesCertId || "").trim();
+    const versionRaw = Number(req.body?.version);
+    const version = Number.isFinite(versionRaw) && versionRaw > 0 ? Math.floor(versionRaw) : 1;
+
+    const metadataDoc: PinnedMetadata = {
+      certId,
+      fileCid,
+      fileHash: `0x${fileHash}`,
+      title,
+      recipient,
+      version,
+      replacesCertId,
+      sourceFileName: req.file.originalname,
+      sourceFileType: req.file.mimetype,
+      createdAt: new Date().toISOString(),
+    };
+
+    const metadataCid = await pinJsonToIpfs(
+      metadataDoc,
+      jwt,
+      `${certId || "certificate"}.metadata.json`
+    );
+
+    return res.json({
+      metadataCid,
+      fileCid,
+      fileHash: `0x${fileHash}`,
+      metadata: metadataDoc,
+      // Backward-compat alias
+      cid: fileCid,
+    });
   } catch (err: any) {
     const status = err?.response?.status;
     const details = err?.response?.data || err?.message || String(err);
@@ -810,6 +891,46 @@ app.get("/api/certificates", async (req, res) => {
     console.error("Certificates index failed:", err?.message);
     return res.status(500).json({
       error: "Certificates index failed",
+      message: err?.message || String(err),
+    });
+  }
+});
+
+/**
+ * Full replacement/version chain for a certificate.
+ * Example: CERT-DEMO-001 -> CERT-DEMO-003 -> CERT-DEMO-005
+ */
+app.get("/api/certificates/:certId/history", async (req, res) => {
+  try {
+    await ensureCertificateIndexFresh();
+    const certId = toSingleString(req.params.certId).trim();
+    if (!certId) {
+      return res.status(400).json({ error: "certId is required" });
+    }
+
+    const history = buildCertificateHistory(certId);
+    if (!history) {
+      return res.status(404).json({
+        error: "Certificate not found",
+        certId,
+      });
+    }
+
+    const chainIds = history.chain.map((item) => item.certId);
+    const requestedIndex = chainIds.indexOf(certId);
+
+    return res.json({
+      certId,
+      rootCertId: history.rootCertId,
+      chainLength: history.chain.length,
+      chainIds,
+      requestedIndex,
+      chain: history.chain,
+    });
+  } catch (err: any) {
+    console.error("Certificate history failed:", err?.message);
+    return res.status(500).json({
+      error: "Certificate history failed",
       message: err?.message || String(err),
     });
   }
@@ -1048,6 +1169,63 @@ app.post("/api/revoke", async (req, res) => {
     console.error("Revoke failed:", err?.shortMessage || err?.message);
     return res.status(500).json({
       error: "Revoke failed",
+      message: err?.shortMessage || err?.message || String(err),
+    });
+  }
+});
+
+/**
+ * Admin: add/remove issuer on-chain.
+ * Requires JWT bearer auth, authorized issuer wallet, and backend signer must be contract owner.
+ *
+ * Body: { issuer: string, allowed: boolean }
+ */
+app.post("/api/admin/issuer", async (req, res) => {
+  try {
+    const auth = await ensureJwtAddressIsAuthorizedIssuer(req, res);
+    if (!auth) return;
+
+    const issuerRaw = String(req.body?.issuer || "").trim();
+    const issuer = normalizeAddress(issuerRaw);
+    const allowed = Boolean(req.body?.allowed);
+
+    if (!issuer) {
+      return res.status(400).json({ error: "Invalid issuer address" });
+    }
+
+    const signer = createRelaySignerOrRespond(res);
+    if (!signer) return;
+    if (signer.address.toLowerCase() !== auth.address.toLowerCase()) {
+      return res.status(403).json({
+        error: "Authenticated wallet does not match backend issuer signer",
+      });
+    }
+
+    const contractAddress = loadDeploymentAddress();
+    const contract = new Contract(contractAddress, CERTIFICATE_REGISTRY_ABI, signer);
+
+    const owner = String((await contract.getFunction("owner").staticCall()) as string).toLowerCase();
+    if (owner !== signer.address.toLowerCase()) {
+      return res.status(403).json({
+        error: "Backend signer is not contract owner",
+      });
+    }
+
+    const setIssuerFn = contract.getFunction("setIssuer");
+    const tx = await setIssuerFn.send(issuer, allowed);
+    const receipt = await tx.wait();
+
+    return res.json({
+      ok: true,
+      issuer,
+      allowed,
+      txHash: receipt?.hash ?? tx.hash,
+      blockNumber: receipt?.blockNumber ?? null,
+    });
+  } catch (err: any) {
+    console.error("Set issuer failed:", err?.shortMessage || err?.message);
+    return res.status(500).json({
+      error: "Set issuer failed",
       message: err?.shortMessage || err?.message || String(err),
     });
   }

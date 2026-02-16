@@ -1,11 +1,13 @@
+@import url("https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&display=swap");
+
 :root {
   color-scheme: light;
-  font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+  font-family: "Sora", "Segoe UI", sans-serif;
   background:
-    radial-gradient(circle at 20% 10%, #fce9db 0%, transparent 45%),
-    radial-gradient(circle at 90% 80%, #dbeefc 0%, transparent 40%),
-    #f7f8fa;
-  color: #1e2a2f;
+    radial-gradient(circle at 8% 8%, #ffe3c6 0%, transparent 42%),
+    radial-gradient(circle at 92% 88%, #cfeeff 0%, transparent 38%),
+    linear-gradient(180deg, #f9fcff 0%, #f2f7fa 100%);
+  color: #11202a;
 }
 
 * {
@@ -15,6 +17,7 @@
 body {
   margin: 0;
   min-height: 100vh;
+  font-weight: 600;
 }
 
 a {
@@ -22,9 +25,9 @@ a {
 }
 
 .shell {
-  max-width: 960px;
+  max-width: 1080px;
   margin: 0 auto;
-  padding: 20px;
+  padding: 24px;
 }
 
 .topbar {
@@ -32,14 +35,67 @@ a {
   flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 22px;
+  gap: 18px;
+  margin-bottom: 26px;
+  background: #f9fbfd;
+  border: 2px solid #d7e4ec;
+  border-radius: 24px;
+  padding: 18px 20px;
+  backdrop-filter: blur(8px);
 }
 
-.brand {
-  font-size: 1.35rem;
+.brand-lockup {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.logo-button {
+  border: 0;
+  background: #ffffff;
+  padding: 0;
+  cursor: pointer;
+  line-height: 0;
+  border-radius: 14px;
+  width: 74px;
+  height: 74px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: inset 0 0 0 1px #d9e6ee;
+}
+
+.logo-button:focus-visible {
+  outline: 2px solid #0b8da8;
+  outline-offset: 4px;
+  border-radius: 10px;
+}
+
+.brand-logo {
+  width: 100px;
+  height: 100px;
+  flex: 0 0 auto;
+}
+
+.brand-text {
+  display: flex;
+  flex-direction: column;
+  gap: 0px;
+}
+
+.brand-main {
+  font-size: 3.04rem;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+  line-height: 0.95;
+  color: #0e2330;
+}
+
+.brand-sub {
+  font-size: .85rem;
   font-weight: 700;
-  letter-spacing: 0.02em;
+  letter-spacing: 0.01em;
+  color: #152d3a;
 }
 
 .nav {
@@ -47,11 +103,24 @@ a {
   gap: 14px;
 }
 
+.header-right {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+  background: #f9fbfd;
+  border: 0px solid #dbe7ee;
+  border-radius: 16px;
+  padding: 12px 14px;
+}
+
 .nav a {
   text-decoration: none;
-  padding: 6px 10px;
-  border-radius: 8px;
-  background: #ffffffbb;
+  padding: 8px 14px;
+  border-radius: 10px;
+  background: #ffffff;
+  border: 1px solid #d5e3ea;
+  font-weight: 700;
 }
 
 .auth-pill {
@@ -62,11 +131,19 @@ a {
 
 .auth-pill button {
   border: 0;
-  border-radius: 8px;
-  padding: 8px 12px;
+  border-radius: 10px;
+  padding: 10px 14px;
   cursor: pointer;
-  background: #1e2a2f;
+  font-family: inherit;
+  font-weight: 700;
+  background: #1a2631;
   color: #fff;
+}
+
+.auth-pill span {
+  font-size: 1rem;
+  font-weight: 700;
+  letter-spacing: 0.01em;
 }
 
 .page {
@@ -74,16 +151,31 @@ a {
 }
 
 .card {
-  background: #ffffffcc;
-  backdrop-filter: blur(4px);
-  border: 1px solid #dce4e8;
-  border-radius: 14px;
-  padding: 20px;
+  background: #ffffffd6;
+  backdrop-filter: blur(6px);
+  border: 1px solid #d3e0e8;
+  border-radius: 18px;
+  padding: 24px;
+  box-shadow: 0 14px 34px rgba(16, 41, 61, 0.08);
+}
+
+.card h1 {
+  margin: 4px 0 10px;
+  font-size: 2.85rem;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+}
+
+.card h2 {
+  margin: 6px 0 10px;
+  font-size: 1.5rem;
+  font-weight: 800;
 }
 
 .sub {
   margin-top: 4px;
-  color: #4d5e66;
+  color: #51636e;
+  font-weight: 600;
 }
 
 .form {
@@ -95,24 +187,30 @@ a {
 .form label {
   display: grid;
   gap: 6px;
-  font-size: 0.95rem;
+  font-size: 1.02rem;
+  font-weight: 700;
 }
 
 .form input {
   width: 100%;
-  border: 1px solid #c9d5db;
-  border-radius: 8px;
-  padding: 10px;
-  font-size: 0.95rem;
+  border: 1px solid #bdd0db;
+  border-radius: 11px;
+  padding: 12px 13px;
+  font-size: 1.02rem;
+  font-family: inherit;
+  font-weight: 600;
+  background: #fff;
 }
 
 .form button {
   border: 0;
-  border-radius: 10px;
-  padding: 10px 14px;
+  border-radius: 11px;
+  padding: 12px 15px;
   cursor: pointer;
-  font-weight: 700;
-  background: #0a6c86;
+  font-family: inherit;
+  font-weight: 800;
+  letter-spacing: 0.01em;
+  background: linear-gradient(135deg, #0b8da8 0%, #0b6f95 100%);
   color: #fff;
 }
 
@@ -121,14 +219,20 @@ a {
   cursor: default;
 }
 
+.action-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 .section-divider {
-  margin: 18px 0;
+  margin: 20px 0;
   border: 0;
-  border-top: 1px solid #dce4e8;
+  border-top: 1px solid #d3e0e8;
 }
 
 .revoke-button {
-  background: #8f1f36 !important;
+  background: linear-gradient(135deg, #a22641 0%, #851f35 100%) !important;
 }
 
 .error {
@@ -139,9 +243,9 @@ a {
 
 .result {
   margin-top: 16px;
-  border: 1px solid #d3dfe4;
-  border-radius: 10px;
-  padding: 14px;
+  border: 1px solid #cfdee6;
+  border-radius: 12px;
+  padding: 15px;
   background: #fff;
 }
 
@@ -152,6 +256,51 @@ a {
   border: 1px solid #d6e2e8;
   border-radius: 8px;
   padding: 10px;
+}
+
+.chain-panel {
+  overflow-x: auto;
+}
+
+.chain-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: max-content;
+  padding-top: 6px;
+}
+
+.chain-item-wrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.chain-item {
+  border: 1px solid #cfd9df;
+  border-radius: 10px;
+  background: #f9fcfd;
+  padding: 8px 10px;
+  min-width: 140px;
+}
+
+.chain-item-active {
+  border-color: #0a6c86;
+  background: #eaf7fb;
+}
+
+.chain-id {
+  font-weight: 700;
+}
+
+.chain-meta {
+  color: #4d5e66;
+  font-size: 0.85rem;
+}
+
+.chain-arrow {
+  color: #5a6d76;
+  font-weight: 700;
 }
 
 .status-valid {
@@ -174,5 +323,47 @@ a {
   to {
     opacity: 1;
     transform: translateY(0);
+  }
+}
+
+@media (max-width: 880px) {
+  .brand-main {
+    font-size: 2rem;
+  }
+
+  .brand-sub {
+    font-size: 1.05rem;
+  }
+
+  .card h1 {
+    font-size: 2rem;
+  }
+
+  .shell {
+    padding: 14px;
+  }
+
+  .topbar {
+    border-radius: 14px;
+    padding: 10px 12px;
+  }
+
+  .logo-button {
+    width: 54px;
+    height: 54px;
+  }
+
+  .brand-logo {
+    width: 38px;
+    height: 38px;
+  }
+
+  .header-right {
+    width: 100%;
+    align-items: flex-start;
+  }
+
+  .auth-pill span {
+    font-size: 1rem;
   }
 }
