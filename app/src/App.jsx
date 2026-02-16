@@ -1,9 +1,10 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link, Navigate, Route, Routes } from "react-router-dom";
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:5050";
 const TOKEN_KEY = "cert_demo_jwt";
 const ADDRESS_KEY = "cert_demo_wallet";
+const SITE_TITLE = "CertChain – Decentralized Academic Verification";
 
 function getStoredAuth() {
   return {
@@ -25,9 +26,32 @@ async function apiJson(url, options = {}) {
   }
 
   if (!response.ok) {
-    throw new Error(parsed.error || parsed.message || `HTTP ${response.status}`);
+    const parsedError = String(parsed.error || "").trim();
+    const parsedMessage = String(parsed.message || "").trim();
+    const genericErrors = new Set([
+      "Issue failed",
+      "Revoke failed",
+      "Verification failed",
+      "Pinata upload failed",
+    ]);
+    const preferredMessage =
+      parsedMessage && (genericErrors.has(parsedError) || !parsedError)
+        ? parsedMessage
+        : parsedError || parsedMessage;
+    throw new Error(preferredMessage || `HTTP ${response.status}`);
   }
   return parsed;
+}
+
+function normalizeIssueErrorMessage(error) {
+  const raw = String(error?.message || error || "");
+  if (raw.toLowerCase().includes("certificate already exists")) {
+    return "Certificate already exists";
+  }
+  if (raw.toLowerCase().includes("could not decode result data")) {
+    return "Backend ABI mismatch with deployed contract. Redeploy contract, refresh deployments.json, then restart backend.";
+  }
+  return raw || "Issue failed";
 }
 
 async function signInWithWallet() {
@@ -64,6 +88,9 @@ async function signInWithWallet() {
 
 function App() {
   const [auth, setAuth] = useState(() => getStoredAuth());
+  useEffect(() => {
+    document.title = SITE_TITLE;
+  }, []);
 
   const isAuthenticated = useMemo(() => Boolean(auth.token), [auth.token]);
 
@@ -76,7 +103,7 @@ function App() {
   return (
     <div className="shell">
       <header className="topbar">
-        <div className="brand">Cert Registry Demo</div>
+        <div className="brand">{SITE_TITLE}</div>
         <nav className="nav">
           <Link to="/verify">Verify</Link>
           <Link to="/issue">Issue</Link>
@@ -128,6 +155,10 @@ function IssuePage({ auth, onAuthChange }) {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
+  const [revokeCertId, setRevokeCertId] = useState("");
+  const [revokeLoading, setRevokeLoading] = useState(false);
+  const [revokeResult, setRevokeResult] = useState(null);
+  const [revokeError, setRevokeError] = useState("");
 
   async function ensureAuth() {
     if (auth.token) return auth;
@@ -185,9 +216,40 @@ function IssuePage({ auth, onAuthChange }) {
 
       setResult(issueResp);
     } catch (submitError) {
-      setError(submitError.message || String(submitError));
+      setError(normalizeIssueErrorMessage(submitError));
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function onRevoke(event) {
+    event.preventDefault();
+    setRevokeError("");
+    setRevokeResult(null);
+
+    if (!revokeCertId.trim()) {
+      setRevokeError("Enter certificate ID to revoke.");
+      return;
+    }
+
+    setRevokeLoading(true);
+    try {
+      const currentAuth = await ensureAuth();
+      const revokeResp = await apiJson(`${API_BASE}/api/revoke`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${currentAuth.token}`,
+        },
+        body: JSON.stringify({
+          certId: revokeCertId.trim(),
+        }),
+      });
+      setRevokeResult(revokeResp);
+    } catch (submitError) {
+      setRevokeError(submitError.message || String(submitError));
+    } finally {
+      setRevokeLoading(false);
     }
   }
 
@@ -250,6 +312,30 @@ function IssuePage({ auth, onAuthChange }) {
           <p><strong>certId:</strong> {result.certId}</p>
           <p><strong>metadataCid:</strong> {result.metadataCid}</p>
           <p><strong>txHash:</strong> {result.txHash}</p>
+        </div>
+      ) : null}
+
+      <hr className="section-divider" />
+
+      <h2>Revoke Certificate</h2>
+      <p className="sub">Protected route. Revoke by certificate ID.</p>
+
+      <form className="form" onSubmit={onRevoke}>
+        <label>
+          Certificate ID
+          <input value={revokeCertId} onChange={(e) => setRevokeCertId(e.target.value)} required />
+        </label>
+        <button className="revoke-button" type="submit" disabled={revokeLoading}>
+          {revokeLoading ? "Revoking..." : "Revoke"}
+        </button>
+      </form>
+
+      {revokeError ? <p className="error">{revokeError}</p> : null}
+      {revokeResult ? (
+        <div className="result">
+          <h2>Revoked</h2>
+          <p><strong>certId:</strong> {revokeResult.certId}</p>
+          <p><strong>txHash:</strong> {revokeResult.txHash}</p>
         </div>
       ) : null}
     </section>

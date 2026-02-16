@@ -121,6 +121,16 @@ a {
   cursor: default;
 }
 
+.section-divider {
+  margin: 18px 0;
+  border: 0;
+  border-top: 1px solid #dce4e8;
+}
+
+.revoke-button {
+  background: #8f1f36 !important;
+}
+
 .error {
   margin-top: 14px;
   color: #ad233c;

@@ -875,6 +875,54 @@ app.post("/api/issue", async (req, res) => {
       });
     }
 
+    const readContract = getReadOnlyContract();
+    const existingCert = (await readContract.getFunction("getCertificate").staticCall(certId)) as [
+      string,
+      string,
+      string,
+      string,
+      bigint,
+      string,
+      bigint,
+      boolean,
+      boolean,
+    ];
+    if (existingCert[8]) {
+      return res.status(409).json({
+        error: "Certificate already exists",
+        certId,
+      });
+    }
+
+    if (version > 1) {
+      const replacedCert = (await readContract.getFunction("getCertificate").staticCall(replacesCertId)) as [
+        string,
+        string,
+        string,
+        string,
+        bigint,
+        string,
+        bigint,
+        boolean,
+        boolean,
+      ];
+
+      const replacedExists = replacedCert[8];
+      const replacedRevoked = replacedCert[7];
+      if (!replacedExists) {
+        return res.status(400).json({
+          error: "Replaced certificate not found",
+          replacesCertId,
+        });
+      }
+      if (!replacedRevoked) {
+        return res.status(400).json({
+          error: "Replaced certificate must be revoked before issuing a replacement",
+          replacesCertId,
+        });
+      }
+    }
+
     const signer = createRelaySignerOrRespond(res);
     if (!signer) return;
     if (signer.address.toLowerCase() !== auth.address.toLowerCase()) {
@@ -942,6 +990,12 @@ app.post("/api/issue", async (req, res) => {
     });
   } catch (err: any) {
     console.error("Issue failed:", err?.shortMessage || err?.message);
+    const issueError = String(err?.shortMessage || err?.message || "");
+    if (issueError.toLowerCase().includes("missing revert data")) {
+      return res.status(400).json({
+        error: "Transaction reverted. Check version/replacement rules and issuer permissions.",
+      });
+    }
     return res.status(500).json({
       error: "Issue failed",
       message: err?.shortMessage || err?.message || String(err),
