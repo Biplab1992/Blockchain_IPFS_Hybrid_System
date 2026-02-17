@@ -92,13 +92,16 @@ const CERTIFICATE_REGISTRY_ABI = [
   "function revokeCertificate(string certId)",
   "function setIssuer(address issuer, bool allowed)",
   "function authorizedIssuers(address issuer) view returns (bool)",
-  "event CertificateIssued(string indexed certId, string cid, address indexed issuer, uint256 issuedAt)",
+  "event CertificateIssued(string indexed certId, string cid, address indexed issuer, uint256 version, string replacesCertId, uint256 issuedAt)",
   "event CertificateRevoked(string indexed certId, address indexed issuer, uint256 revokedAt)",
 ];
 
 type CertificateIndexEntry = {
   certId: string;
   cid: string;
+  metadataCid: string;
+  fileCid: string;
+  fileHash: string;
   issuer: string;
   version: number;
   replacesCertId: string;
@@ -113,8 +116,62 @@ type CertificateIndexEntry = {
 
 const certificateIndexCache = new Map<string, CertificateIndexEntry>();
 const certificateIndexRefreshMs = Number(process.env.CERT_INDEX_REFRESH_MS || 15000);
+const certificateIndexBatchSize = Math.max(
+  1,
+  Number(process.env.CERT_INDEX_BLOCK_BATCH_SIZE || 2000)
+);
+const certificateIndexPollMs = Math.max(
+  2000,
+  Number(process.env.CERT_INDEX_POLL_MS || 15000)
+);
+const certificateIndexRequestDelayMs = Math.max(
+  0,
+  Number(process.env.CERT_INDEX_REQUEST_DELAY_MS || 250)
+);
+const certificateIndexStartBlock = Math.max(
+  0,
+  Number(process.env.CERT_INDEX_START_BLOCK || 0)
+);
+const contractNetworkName = process.env.CONTRACT_NETWORK_NAME || "localhost";
+const supabaseUrl = (process.env.SUPABASE_URL || "").trim().replace(/\/+$/, "");
+const supabaseServiceRoleKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
+const useSupabaseIndexer = Boolean(supabaseUrl && supabaseServiceRoleKey);
+
+if ((supabaseUrl && !supabaseServiceRoleKey) || (!supabaseUrl && supabaseServiceRoleKey)) {
+  console.warn(
+    "Supabase indexer not enabled: set both SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY"
+  );
+}
+
+const certificateIndexStateDir = path.join(workspaceRoot, "backend", ".indexer");
+const certificateIndexStateFile = path.join(
+  certificateIndexStateDir,
+  `certificates-${contractNetworkName}.json`
+);
+
 let certificateIndexLastUpdatedAtMs = 0;
-let certificateIndexRebuildPromise: Promise<void> | null = null;
+let certificateIndexLastIndexedBlock = certificateIndexStartBlock - 1;
+let certificateIndexBootstrapPromise: Promise<void> | null = null;
+let certificateIndexSyncPromise: Promise<void> | null = null;
+let providerMaxLogRange = certificateIndexBatchSize;
+
+type CertificateRow = {
+  cert_id: string;
+  issuer: string | null;
+  metadata_cid: string | null;
+  file_cid: string | null;
+  file_hash: string | null;
+  version: number | null;
+  replaces_cert_id: string | null;
+  revoked: boolean | null;
+  issue_tx: string | null;
+  revoke_tx: string | null;
+  block_number: number | null;
+  revoke_block_number?: number | null;
+  issued_at?: number | null;
+  revoked_at?: number | null;
+  updated_at?: string | null;
+};
 
 class GatewayFetchError extends Error {
   attempts: Array<{
@@ -176,6 +233,19 @@ function loadDeploymentAddress(): string {
   }
 
   return address;
+}
+
+function resolveRpcUrl(): string {
+  const direct = (process.env.RPC_URL || "").trim();
+  if (direct) return direct;
+
+  const networkName = (process.env.CONTRACT_NETWORK_NAME || "localhost").toLowerCase();
+  if (networkName === "sepolia") {
+    const sepolia = (process.env.SEPOLIA_RPC_URL || "").trim();
+    if (sepolia) return sepolia;
+  }
+
+  return "http://127.0.0.1:8545";
 }
 
 async function fetchCidBytes(cid: string): Promise<Buffer> {
@@ -373,7 +443,7 @@ function requireJwtAuth(req: express.Request, res: express.Response): AuthClaims
 }
 
 function getReadOnlyContract(): Contract {
-  const rpcUrl = process.env.RPC_URL || "http://127.0.0.1:8545";
+  const rpcUrl = resolveRpcUrl();
   const contractAddress = loadDeploymentAddress();
   const provider = new JsonRpcProvider(rpcUrl);
   return new Contract(contractAddress, CERTIFICATE_REGISTRY_ABI, provider);
@@ -394,82 +464,586 @@ function isEventLog(log: unknown): log is EventLog {
   return Boolean(log && typeof log === "object" && "args" in (log as Record<string, unknown>));
 }
 
-async function rebuildCertificateIndexFromEvents(): Promise<void> {
-  const contract = getReadOnlyContract();
-  const fromBlock = 0;
-  const toBlock = "latest";
-  const issuedEvent = contract.getEvent("CertificateIssued");
-  const revokedEvent = contract.getEvent("CertificateRevoked");
+function toCertificateRow(entry: CertificateIndexEntry): CertificateRow {
+  return {
+    cert_id: entry.certId,
+    issuer: entry.issuer || null,
+    metadata_cid: entry.metadataCid || entry.cid || null,
+    file_cid: entry.fileCid || "",
+    file_hash: entry.fileHash || "",
+    version: entry.version,
+    replaces_cert_id: entry.replacesCertId || null,
+    revoked: entry.revoked,
+    issue_tx: entry.issueTxHash || null,
+    revoke_tx: entry.revokeTxHash || null,
+    block_number: entry.issueBlockNumber || null,
+    // Keep payload minimal for compatibility with earlier table schemas.
+    updated_at: new Date().toISOString(),
+  };
+}
 
-  const issuedLogs = await contract.queryFilter(issuedEvent, fromBlock, toBlock);
-  const revokedLogs = await contract.queryFilter(revokedEvent, fromBlock, toBlock);
+function fromCertificateRow(row: CertificateRow): CertificateIndexEntry {
+  const metadataCid = row.metadata_cid || "";
+  return {
+    certId: row.cert_id,
+    cid: metadataCid,
+    metadataCid,
+    fileCid: row.file_cid || "",
+    fileHash: row.file_hash || "",
+    issuer: (row.issuer || "").toLowerCase(),
+    version: Number(row.version || 0),
+    replacesCertId: row.replaces_cert_id || "",
+    issuedAt: Number(row.issued_at || 0),
+    revoked: Boolean(row.revoked),
+    revokedAt: row.revoked_at === null || row.revoked_at === undefined ? null : Number(row.revoked_at),
+    issueTxHash: row.issue_tx || "",
+    revokeTxHash: row.revoke_tx || null,
+    issueBlockNumber: Number(row.block_number || 0),
+    revokeBlockNumber:
+      row.revoke_block_number === null || row.revoke_block_number === undefined
+        ? null
+        : Number(row.revoke_block_number),
+  };
+}
 
-  certificateIndexCache.clear();
+function getSupabaseHeaders() {
+  return {
+    apikey: supabaseServiceRoleKey,
+    Authorization: `Bearer ${supabaseServiceRoleKey}`,
+    "Content-Type": "application/json",
+  };
+}
 
-  for (const log of issuedLogs) {
-    if (!isEventLog(log)) continue;
-    const certId = String(log.args?.[0] ?? "");
-    if (!certId) continue;
-
-    certificateIndexCache.set(certId, {
-      certId,
-      cid: String(log.args?.[1] ?? ""),
-      issuer: String(log.args?.[2] ?? "").toLowerCase(),
-      version: Number(log.args?.[3] ?? 1),
-      replacesCertId: String(log.args?.[4] ?? ""),
-      issuedAt: Number(log.args?.[5] ?? 0),
-      revoked: false,
-      revokedAt: null,
-      issueTxHash: log.transactionHash,
-      revokeTxHash: null,
-      issueBlockNumber: log.blockNumber,
-      revokeBlockNumber: null,
-    });
+async function supabaseRequest<T>(options: {
+  method: "GET" | "POST";
+  tablePath: string;
+  params?: Record<string, string>;
+  body?: unknown;
+  prefer?: string;
+}): Promise<T> {
+  if (!useSupabaseIndexer) {
+    throw new Error("Supabase indexer not configured");
   }
 
-  for (const log of revokedLogs) {
-    if (!isEventLog(log)) continue;
-    const certId = String(log.args?.[0] ?? "");
-    if (!certId) continue;
-
-    const current = certificateIndexCache.get(certId);
-    if (current) {
-      current.revoked = true;
-      current.revokedAt = Number(log.args?.[2] ?? 0);
-      current.revokeTxHash = log.transactionHash;
-      current.revokeBlockNumber = log.blockNumber;
-    } else {
-      certificateIndexCache.set(certId, {
-        certId,
-        cid: "",
-        issuer: String(log.args?.[1] ?? "").toLowerCase(),
-        version: 0,
-        replacesCertId: "",
-        issuedAt: 0,
-        revoked: true,
-        revokedAt: Number(log.args?.[2] ?? 0),
-        issueTxHash: "",
-        revokeTxHash: log.transactionHash,
-        issueBlockNumber: 0,
-        revokeBlockNumber: log.blockNumber,
-      });
+  const url = new URL(`${supabaseUrl}/rest/v1/${options.tablePath}`);
+  if (options.params) {
+    for (const [key, value] of Object.entries(options.params)) {
+      url.searchParams.set(key, value);
     }
   }
 
-  certificateIndexLastUpdatedAtMs = Date.now();
+  const headers: Record<string, string> = getSupabaseHeaders();
+  if (options.prefer) headers.Prefer = options.prefer;
+
+  const response = await axios.request<T>({
+    method: options.method,
+    url: url.toString(),
+    headers,
+    data: options.body,
+    validateStatus: (status) => status >= 200 && status < 300,
+  });
+  return response.data;
+}
+
+function describeAxiosError(err: unknown): string {
+  const anyErr = err as any;
+  const status = anyErr?.response?.status;
+  const data = anyErr?.response?.data;
+  if (status) {
+    return `status=${status} data=${JSON.stringify(data)}`;
+  }
+  return anyErr?.message || String(err);
+}
+
+async function rebuildCertificateIndexFromEvents(): Promise<void> {
+  certificateIndexCache.clear();
+  certificateIndexLastIndexedBlock = certificateIndexStartBlock - 1;
+  await saveCertificateIndexerState();
+  await syncCertificateIndexToLatest();
 }
 
 async function ensureCertificateIndexFresh(): Promise<void> {
-  const isFresh = Date.now() - certificateIndexLastUpdatedAtMs <= certificateIndexRefreshMs;
-  if (isFresh && certificateIndexCache.size > 0) return;
-
-  if (!certificateIndexRebuildPromise) {
-    certificateIndexRebuildPromise = rebuildCertificateIndexFromEvents().finally(() => {
-      certificateIndexRebuildPromise = null;
+  if (!certificateIndexBootstrapPromise) {
+    certificateIndexBootstrapPromise = bootstrapCertificateIndexer().finally(() => {
+      certificateIndexBootstrapPromise = null;
     });
   }
 
-  await certificateIndexRebuildPromise;
+  await certificateIndexBootstrapPromise;
+
+  const isFresh = Date.now() - certificateIndexLastUpdatedAtMs <= certificateIndexRefreshMs;
+  if (isFresh) return;
+
+  if (!certificateIndexSyncPromise) {
+    certificateIndexSyncPromise = syncCertificateIndexToLatest().finally(() => {
+      certificateIndexSyncPromise = null;
+    });
+  }
+  await certificateIndexSyncPromise;
+}
+
+type CertificateIndexerState = {
+  networkName: string;
+  contractAddress: string;
+  lastIndexedBlock: number;
+  updatedAtIso: string;
+};
+
+function readLocalCertificateIndexerState(): CertificateIndexerState | null {
+  try {
+    if (!fs.existsSync(certificateIndexStateFile)) return null;
+    const raw = fs.readFileSync(certificateIndexStateFile, "utf8");
+    const parsed = JSON.parse(raw) as Partial<CertificateIndexerState>;
+    if (
+      typeof parsed?.networkName !== "string" ||
+      typeof parsed?.contractAddress !== "string" ||
+      typeof parsed?.lastIndexedBlock !== "number"
+    ) {
+      return null;
+    }
+    return {
+      networkName: parsed.networkName,
+      contractAddress: parsed.contractAddress,
+      lastIndexedBlock: Math.floor(parsed.lastIndexedBlock),
+      updatedAtIso:
+        typeof parsed.updatedAtIso === "string"
+          ? parsed.updatedAtIso
+          : new Date().toISOString(),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function saveLocalCertificateIndexerState(): Promise<void> {
+  const contractAddress = loadDeploymentAddress().toLowerCase();
+  const payload: CertificateIndexerState = {
+    networkName: contractNetworkName,
+    contractAddress,
+    lastIndexedBlock: certificateIndexLastIndexedBlock,
+    updatedAtIso: new Date().toISOString(),
+  };
+
+  await fs.promises.mkdir(certificateIndexStateDir, { recursive: true });
+  await fs.promises.writeFile(
+    certificateIndexStateFile,
+    JSON.stringify(payload, null, 2),
+    "utf8"
+  );
+}
+
+async function readSupabaseCertificateIndexerState(): Promise<CertificateIndexerState | null> {
+  const rows = await supabaseRequest<Array<{ id: string; last_block: number | null }>>({
+    method: "GET",
+    tablePath: "indexer_state",
+    params: {
+      select: "id,last_block",
+      id: `eq.${contractNetworkName}`,
+      limit: "1",
+    },
+  });
+
+  const row = rows[0];
+  if (!row) return null;
+
+  return {
+    networkName: row.id,
+    contractAddress: loadDeploymentAddress().toLowerCase(),
+    lastIndexedBlock: Math.floor(Number(row.last_block || certificateIndexStartBlock - 1)),
+    updatedAtIso: new Date().toISOString(),
+  };
+}
+
+async function saveSupabaseCertificateIndexerState(): Promise<void> {
+  await supabaseRequest<unknown>({
+    method: "POST",
+    tablePath: "indexer_state",
+    params: { on_conflict: "id" },
+    body: [
+      {
+        id: contractNetworkName,
+        last_block: certificateIndexLastIndexedBlock,
+      },
+    ],
+    prefer: "resolution=merge-duplicates,return=minimal",
+  });
+}
+
+async function readCertificateIndexerState(): Promise<CertificateIndexerState | null> {
+  if (useSupabaseIndexer) {
+    try {
+      return await readSupabaseCertificateIndexerState();
+    } catch (err: any) {
+      console.error("Supabase indexer_state read failed:", describeAxiosError(err));
+    }
+  }
+  return readLocalCertificateIndexerState();
+}
+
+async function saveCertificateIndexerState(): Promise<void> {
+  if (useSupabaseIndexer) {
+    try {
+      await saveSupabaseCertificateIndexerState();
+      return;
+    } catch (err: any) {
+      console.error("Supabase indexer_state write failed:", describeAxiosError(err));
+    }
+  }
+  await saveLocalCertificateIndexerState();
+}
+
+async function upsertSupabaseCertificates(entries: CertificateIndexEntry[]): Promise<void> {
+  if (entries.length === 0) return;
+  await supabaseRequest<unknown>({
+    method: "POST",
+    tablePath: "certificates",
+    params: { on_conflict: "cert_id" },
+    body: entries.map(toCertificateRow),
+    prefer: "resolution=merge-duplicates,return=minimal",
+  });
+}
+
+async function loadSupabaseCertificatesIntoCache(): Promise<void> {
+  const rows = await supabaseRequest<CertificateRow[]>({
+    method: "GET",
+    tablePath: "certificates",
+    params: {
+      // Select all columns to stay compatible with partially-migrated tables.
+      select: "*",
+      order: "block_number.asc",
+    },
+  });
+
+  for (const row of rows) {
+    const entry = fromCertificateRow(row);
+    certificateIndexCache.set(entry.certId, entry);
+  }
+}
+
+async function persistCertificates(entries: CertificateIndexEntry[]): Promise<void> {
+  if (useSupabaseIndexer) {
+    try {
+      await upsertSupabaseCertificates(entries);
+      return;
+    } catch (err: any) {
+      console.error("Supabase certificates upsert failed:", describeAxiosError(err));
+    }
+  }
+}
+
+async function hydrateCacheFromPersistentStore(): Promise<void> {
+  if (!useSupabaseIndexer) return;
+  try {
+    await loadSupabaseCertificatesIntoCache();
+  } catch (err: any) {
+    console.error("Supabase certificates bootstrap failed:", describeAxiosError(err));
+  }
+}
+
+function applyIssuedLog(log: EventLog): void {
+  const certId = String(log.args?.[0] ?? "");
+  if (!certId || certId === "[object Object]") return;
+
+  certificateIndexCache.set(certId, {
+    certId,
+    cid: String(log.args?.[1] ?? ""),
+    metadataCid: String(log.args?.[1] ?? ""),
+    fileCid: "",
+    fileHash: "",
+    issuer: String(log.args?.[2] ?? "").toLowerCase(),
+    version: Number(log.args?.[3] ?? 1),
+    replacesCertId: String(log.args?.[4] ?? ""),
+    issuedAt: Number(log.args?.[5] ?? 0),
+    revoked: false,
+    revokedAt: null,
+    issueTxHash: log.transactionHash,
+    revokeTxHash: null,
+    issueBlockNumber: log.blockNumber,
+    revokeBlockNumber: null,
+  });
+}
+
+function applyRevokedLog(log: EventLog): void {
+  const certId = String(log.args?.[0] ?? "");
+  if (!certId || certId === "[object Object]") return;
+
+  const current = certificateIndexCache.get(certId);
+  if (current) {
+    current.revoked = true;
+    current.revokedAt = Number(log.args?.[2] ?? 0);
+    current.revokeTxHash = log.transactionHash;
+    current.revokeBlockNumber = log.blockNumber;
+    return;
+  }
+
+  certificateIndexCache.set(certId, {
+    certId,
+    cid: "",
+    metadataCid: "",
+    fileCid: "",
+    fileHash: "",
+    issuer: String(log.args?.[1] ?? "").toLowerCase(),
+    version: 0,
+    replacesCertId: "",
+    issuedAt: 0,
+    revoked: true,
+    revokedAt: Number(log.args?.[2] ?? 0),
+    issueTxHash: "",
+    revokeTxHash: log.transactionHash,
+    issueBlockNumber: 0,
+    revokeBlockNumber: log.blockNumber,
+  });
+}
+
+function readDirectCertId(arg: unknown): string | null {
+  if (typeof arg !== "string") return null;
+  const trimmed = arg.trim();
+  if (!trimmed || trimmed === "[object Object]") return null;
+  return trimmed;
+}
+
+async function resolveCertIdFromTx(contract: Contract, txHash: string, fnName: string): Promise<string | null> {
+  const provider = contract.runner?.provider;
+  if (!provider) return null;
+  const tx = await provider.getTransaction(txHash);
+  if (!tx?.data) return null;
+
+  try {
+    const parsed = contract.interface.parseTransaction({ data: tx.data, value: tx.value });
+    if (!parsed || parsed.name !== fnName) return null;
+    return readDirectCertId(parsed.args?.[0]);
+  } catch {
+    return null;
+  }
+}
+
+async function enrichEntryFromContract(contract: Contract, entry: CertificateIndexEntry): Promise<void> {
+  try {
+    const cert = (await contract.getFunction("getCertificate").staticCall(entry.certId)) as [
+      string,
+      string,
+      string,
+      string,
+      bigint,
+      string,
+      bigint,
+      boolean,
+      boolean,
+    ];
+
+    if (cert[8]) {
+      entry.metadataCid = cert[0];
+      entry.cid = cert[0];
+      entry.fileCid = cert[1];
+      entry.fileHash = String(cert[2] || "").toLowerCase();
+      entry.issuer = String(cert[3] || "").toLowerCase();
+      entry.version = Number(cert[4] || 0n);
+      entry.replacesCertId = cert[5] || "";
+      entry.issuedAt = Number(cert[6] || 0n);
+      entry.revoked = Boolean(cert[7]);
+    }
+  } catch {
+    // Keep event-derived values if contract read fails.
+  }
+}
+
+function isLogRangeLimitError(err: unknown): boolean {
+  const message = String((err as any)?.message || "").toLowerCase();
+  return message.includes("eth_getlogs is limited to a") || message.includes("range is too wide");
+}
+
+function parseLogRangeLimit(err: unknown): number | null {
+  const message = String((err as any)?.message || "");
+  const match = message.match(/limited to a\s+(\d+)\s+range/i);
+  if (!match) return null;
+  const parsed = Number(match[1]);
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return Math.floor(parsed);
+}
+
+function isRateLimitError(err: unknown): boolean {
+  const message = String((err as any)?.message || "").toLowerCase();
+  return (
+    message.includes("request limit reached") ||
+    message.includes("too many requests") ||
+    message.includes("rate limit")
+  );
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function syncCertificateIndexToLatest(): Promise<void> {
+  const contract = getReadOnlyContract();
+  const latestBlock = await contract.runner!.provider!.getBlockNumber();
+  let fromBlock = Math.max(certificateIndexLastIndexedBlock + 1, certificateIndexStartBlock);
+
+  if (fromBlock > latestBlock) {
+    certificateIndexLastUpdatedAtMs = Date.now();
+    return;
+  }
+
+  const issuedEvent = contract.getEvent("CertificateIssued");
+  const revokedEvent = contract.getEvent("CertificateRevoked");
+
+  while (fromBlock <= latestBlock) {
+    const activeRange = Math.max(1, Math.min(providerMaxLogRange, certificateIndexBatchSize));
+    const toBlock = Math.min(fromBlock + activeRange - 1, latestBlock);
+    let issuedLogsRaw: unknown[] = [];
+    let revokedLogsRaw: unknown[] = [];
+    try {
+      issuedLogsRaw = await contract.queryFilter(issuedEvent, fromBlock, toBlock);
+      if (certificateIndexRequestDelayMs > 0) {
+        await sleep(certificateIndexRequestDelayMs);
+      }
+      revokedLogsRaw = await contract.queryFilter(revokedEvent, fromBlock, toBlock);
+    } catch (err: any) {
+      if (isRateLimitError(err)) {
+        const backoffMs = Math.max(1000, certificateIndexRequestDelayMs * 8);
+        console.warn(`Provider rate limit hit. Backing off for ${backoffMs}ms`);
+        await sleep(backoffMs);
+        continue;
+      }
+
+      if (!isLogRangeLimitError(err)) {
+        throw err;
+      }
+
+      const parsedLimit = parseLogRangeLimit(err);
+      if (parsedLimit !== null) {
+        providerMaxLogRange = Math.max(1, parsedLimit);
+      } else {
+        providerMaxLogRange = Math.max(1, Math.floor(providerMaxLogRange / 2));
+      }
+
+      console.warn(
+        `Provider log range limit detected. Retrying with block window=${providerMaxLogRange}`
+      );
+      continue;
+    }
+
+    const logs = [...issuedLogsRaw, ...revokedLogsRaw]
+      .filter(isEventLog)
+      .sort((a, b) => {
+        if (a.blockNumber !== b.blockNumber) return a.blockNumber - b.blockNumber;
+        return a.index - b.index;
+      });
+
+    const touchedCertIds = new Set<string>();
+
+    for (const log of logs) {
+      if (log.fragment?.name === "CertificateIssued") {
+        let certId = readDirectCertId(log.args?.[0]);
+        if (!certId) {
+          certId = await resolveCertIdFromTx(contract, log.transactionHash, "issueCertificate");
+        }
+        if (!certId) continue;
+        certificateIndexCache.set(certId, {
+          certId,
+          cid: String(log.args?.[1] ?? ""),
+          metadataCid: String(log.args?.[1] ?? ""),
+          fileCid: "",
+          fileHash: "",
+          issuer: String(log.args?.[2] ?? "").toLowerCase(),
+          version: Number(log.args?.[3] ?? 1),
+          replacesCertId: String(log.args?.[4] ?? ""),
+          issuedAt: Number(log.args?.[5] ?? 0),
+          revoked: false,
+          revokedAt: null,
+          issueTxHash: log.transactionHash,
+          revokeTxHash: null,
+          issueBlockNumber: log.blockNumber,
+          revokeBlockNumber: null,
+        });
+        touchedCertIds.add(certId);
+      } else if (log.fragment?.name === "CertificateRevoked") {
+        let certId = readDirectCertId(log.args?.[0]);
+        if (!certId) {
+          certId = await resolveCertIdFromTx(contract, log.transactionHash, "revokeCertificate");
+        }
+        if (!certId) continue;
+
+        const current = certificateIndexCache.get(certId);
+        if (current) {
+          current.revoked = true;
+          current.revokedAt = Number(log.args?.[2] ?? 0);
+          current.revokeTxHash = log.transactionHash;
+          current.revokeBlockNumber = log.blockNumber;
+        } else {
+          certificateIndexCache.set(certId, {
+            certId,
+            cid: "",
+            metadataCid: "",
+            fileCid: "",
+            fileHash: "",
+            issuer: String(log.args?.[1] ?? "").toLowerCase(),
+            version: 0,
+            replacesCertId: "",
+            issuedAt: 0,
+            revoked: true,
+            revokedAt: Number(log.args?.[2] ?? 0),
+            issueTxHash: "",
+            revokeTxHash: log.transactionHash,
+            issueBlockNumber: 0,
+            revokeBlockNumber: log.blockNumber,
+          });
+        }
+        touchedCertIds.add(certId);
+      }
+    }
+
+    const touchedEntries: CertificateIndexEntry[] = [];
+    for (const certId of touchedCertIds) {
+      const entry = certificateIndexCache.get(certId);
+      if (!entry) continue;
+      await enrichEntryFromContract(contract, entry);
+      touchedEntries.push(entry);
+    }
+
+    await persistCertificates(touchedEntries);
+
+    certificateIndexLastIndexedBlock = toBlock;
+    certificateIndexLastUpdatedAtMs = Date.now();
+    await saveCertificateIndexerState();
+    fromBlock = toBlock + 1;
+  }
+}
+
+async function bootstrapCertificateIndexer(): Promise<void> {
+  certificateIndexCache.clear();
+  await hydrateCacheFromPersistentStore();
+
+  const state = await readCertificateIndexerState();
+  const currentAddress = loadDeploymentAddress().toLowerCase();
+
+  if (
+    state &&
+    state.networkName === contractNetworkName &&
+    state.contractAddress.toLowerCase() === currentAddress
+  ) {
+    certificateIndexLastIndexedBlock = Math.max(
+      certificateIndexStartBlock - 1,
+      state.lastIndexedBlock
+    );
+  } else {
+    certificateIndexLastIndexedBlock = certificateIndexStartBlock - 1;
+  }
+
+  await syncCertificateIndexToLatest();
+}
+
+function startCertificateIndexerPolling(): void {
+  setInterval(() => {
+    if (certificateIndexSyncPromise) return;
+    certificateIndexSyncPromise = syncCertificateIndexToLatest()
+      .catch((err: any) => {
+        console.error("Certificate index poll failed:", err?.message || String(err));
+      })
+      .finally(() => {
+        certificateIndexSyncPromise = null;
+      });
+  }, certificateIndexPollMs);
 }
 
 function buildCertificateHistory(seedCertId: string): {
@@ -537,7 +1111,7 @@ async function ensureJwtAddressIsAuthorizedIssuer(req: express.Request, res: exp
 }
 
 function createRelaySignerOrRespond(res: express.Response): Wallet | null {
-  const rpcUrl = process.env.RPC_URL || "http://127.0.0.1:8545";
+  const rpcUrl = resolveRpcUrl();
   const issuerPrivateKey = process.env.ISSUER_PRIVATE_KEY;
   if (!issuerPrivateKey) {
     res.status(500).json({ error: "ISSUER_PRIVATE_KEY is not configured" });
@@ -751,7 +1325,7 @@ app.get("/api/verify/:certId", verifyRateLimiter, async (req, res) => {
     const certId = toSingleString(req.params.certId).trim();
     if (!certId) return res.status(400).json({ error: "certId is required" });
 
-    const rpcUrl = process.env.RPC_URL || "http://127.0.0.1:8545";
+    const rpcUrl = resolveRpcUrl();
     const contractAddress = loadDeploymentAddress();
     const provider = new JsonRpcProvider(rpcUrl);
     const contract = new Contract(contractAddress, CERTIFICATE_REGISTRY_ABI, provider);
@@ -891,6 +1465,31 @@ app.get("/api/certificates", async (req, res) => {
     console.error("Certificates index failed:", err?.message);
     return res.status(500).json({
       error: "Certificates index failed",
+      message: err?.message || String(err),
+    });
+  }
+});
+
+app.get("/api/indexer/status", async (_req, res) => {
+  try {
+    await ensureCertificateIndexFresh();
+    const contract = getReadOnlyContract();
+    const latestBlock = await contract.runner!.provider!.getBlockNumber();
+
+    return res.json({
+      network: contractNetworkName,
+      contractAddress: loadDeploymentAddress(),
+      storage: useSupabaseIndexer ? "supabase" : "local-file",
+      indexedCertificates: certificateIndexCache.size,
+      lastIndexedBlock: certificateIndexLastIndexedBlock,
+      latestBlock,
+      lag: Math.max(0, latestBlock - certificateIndexLastIndexedBlock),
+      refreshedAt: new Date(certificateIndexLastUpdatedAtMs).toISOString(),
+      stateFile: certificateIndexStateFile,
+    });
+  } catch (err: any) {
+    return res.status(500).json({
+      error: "Indexer status failed",
       message: err?.message || String(err),
     });
   }
@@ -1234,6 +1833,10 @@ app.post("/api/admin/issuer", async (req, res) => {
 const port = Number(process.env.PORT || 5050);
 app.listen(port, () => {
   console.log(`Backend running on http://localhost:${port}`);
+  ensureCertificateIndexFresh().catch((err: any) => {
+    console.error("Certificate index bootstrap failed:", err?.message || String(err));
+  });
+  startCertificateIndexerPolling();
 });
 
 app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {

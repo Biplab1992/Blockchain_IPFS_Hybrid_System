@@ -1,5 +1,8 @@
 {
   "localhost": {
     "CertificateRegistry": "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+  },
+  "sepolia": {
+    "CertificateRegistry": "0x8902C800138d987E37157fEEF767C93cB664A7CB"
   }
 }
