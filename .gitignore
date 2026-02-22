@@ -29,3 +29,7 @@ Thumbs.db
 
 # Accidentally extracted VCS metadata from archives
 **/.git/
+
+# Local binary fetch artifacts (not source fixtures)
+fetched.bin
+contracts/cert_from_ipfs.bin

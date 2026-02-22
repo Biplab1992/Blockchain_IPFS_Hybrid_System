@@ -1,57 +1,72 @@
-# Sample Hardhat 3 Beta Project (`mocha` and `ethers`)
+# Contracts
 
-This project showcases a Hardhat 3 Beta project using `mocha` for tests and the `ethers` library for Ethereum interactions.
+## Contract Purpose
 
-To learn more about the Hardhat 3 Beta, please visit the [Getting Started guide](https://hardhat.org/docs/getting-started#getting-started-with-hardhat-3). To share your feedback, join our [Hardhat 3 Beta](https://hardhat.org/hardhat3-beta-telegram-group) Telegram group or [open an issue](https://github.com/NomicFoundation/hardhat/issues/new) in our GitHub issue tracker.
+`CertificateRegistry.sol` is the on-chain trust anchor for certificates issued in this project.
+It stores immutable certificate metadata references and integrity data (CIDs + file hash), tracks revocation state, and enforces issuer governance rules for issuance, replacement, and revocation.
 
-## Project Overview
+The contract is designed to keep large files off-chain (IPFS) while preserving verifiable integrity and auditability on-chain.
 
-This example project includes:
+## Main Contract
 
-- A simple Hardhat configuration file.
-- Foundry-compatible Solidity unit tests.
-- TypeScript integration tests using `mocha` and ethers.js
-- Examples demonstrating how to connect to different types of networks, including locally simulating OP mainnet.
+- `contracts/contracts/CertificateRegistry.sol`
 
-## Usage
+## Key Functions
 
-### Running Tests
+- `setIssuer(address issuer, bool allowed)`
+  - Owner-only function to grant/revoke issuer authorization.
 
-To run all the tests in the project, execute the following command:
+- `issueCertificate(string certId, string metadataCid, string fileCid, bytes32 fileHash, uint256 version, string replacesCertId)`
+  - Issuer-only certificate issuance.
+  - Enforces version/replacement rules:
+    - New certs must start at `version == 1`.
+    - Replacements require `version > 1`.
+    - Replaced certificate must exist and be revoked.
+    - Replacement must be issued by the same original issuer.
 
-```shell
-npx hardhat test
+- `revokeCertificate(string certId)`
+  - Can be called only by:
+    - contract `owner`, or
+    - the certificate’s original `issuer`.
+  - Prevents double-revocation.
+
+- `getCertificate(string certId)`
+  - Returns certificate record fields.
+  - Reverts if the certificate does not exist.
+
+## Key Events
+
+- `CertificateIssued(string indexed certId, string metadataCid, address indexed issuer, uint256 version, string replacesCertId, uint256 issuedAt)`
+- `CertificateRevoked(string indexed certId, address indexed issuer, uint256 revokedAt)`
+- `IssuerAuthorizationUpdated(address indexed issuer, bool allowed)`
+
+## Access Control Model
+
+- Owner role:
+  - Contract deployer is `owner`.
+  - Only owner can manage issuer allowlist (`setIssuer`).
+  - Owner can revoke any certificate.
+
+- Authorized issuer role:
+  - `issueCertificate` requires `authorizedIssuers[msg.sender] == true`.
+  - For replacement certificates, issuer must match the issuer of the replaced cert.
+
+- Certificate-level revoke authorization:
+  - `revokeCertificate` is not merely role-based.
+  - It enforces certificate ownership semantics:
+    - only contract owner or original certificate issuer can revoke.
+
+## Run Tests
+
+From `contracts/`:
+
+```bash
+npm test
 ```
 
-You can also selectively run the Solidity or `mocha` tests:
-
-```shell
-npx hardhat test solidity
-npx hardhat test mocha
-```
-
-### Make a deployment to Sepolia
-
-This project includes an example Ignition module to deploy the contract. You can deploy this module to a locally simulated chain or to Sepolia.
-
-To run the deployment to a local chain:
-
-```shell
-npx hardhat ignition deploy ignition/modules/Counter.ts
-```
-
-To run the deployment to Sepolia, you need an account with funds to send the transaction. The provided Hardhat configuration includes a Configuration Variable called `SEPOLIA_PRIVATE_KEY`, which you can use to set the private key of the account you want to use.
-
-You can set the `SEPOLIA_PRIVATE_KEY` variable using the `hardhat-keystore` plugin or by setting it as an environment variable.
-
-To set the `SEPOLIA_PRIVATE_KEY` config variable using `hardhat-keystore`:
-
-```shell
-npx hardhat keystore set SEPOLIA_PRIVATE_KEY
-```
-
-After setting the variable, you can run the deployment with the Sepolia network:
-
-```shell
-npx hardhat ignition deploy --network sepolia ignition/modules/Counter.ts
-```
+Current test coverage includes:
+- owner-only issuer management
+- authorized issuer issuance
+- revoke permission boundaries and double-revoke protection
+- replacement/version governance rules
+- event emission correctness

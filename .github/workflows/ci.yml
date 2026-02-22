@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            app/package-lock.json
+            backend/package-lock.json
+            contracts/package-lock.json
+
+      - name: Install (root)
+        run: npm ci
+
+      - name: Install (app)
+        run: npm ci
+        working-directory: app
+
+      - name: Install (backend)
+        run: npm ci
+        working-directory: backend
+
+      - name: Install (contracts)
+        run: npm ci
+        working-directory: contracts
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Contract Tests
+        run: npm run test
+
