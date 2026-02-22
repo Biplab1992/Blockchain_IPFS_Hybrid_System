@@ -8,7 +8,17 @@ async function main() {
   const contract = await ethers.getContractAt("CertificateRegistry", contractAddress);
 
   const certId = "CERT-006";
-  const result = await contract.getCertificate(certId);
+  let result;
+  try {
+    result = await contract.getCertificate(certId);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg.toLowerCase().includes("certificate not found")) {
+      console.log("Certificate does not exist:", certId);
+      return;
+    }
+    throw e;
+  }
 
   console.log("getCertificate(", certId, ") =>");
   console.log(result);

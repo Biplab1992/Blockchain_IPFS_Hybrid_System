@@ -15,8 +15,25 @@ async function main() {
 
   const certId = "CERT-006";
 
-  const [metadataCid, fileCidOnChain, onChainHash, issuer, version, replacesCertId, issuedAt, revoked, exists] =
-    await contract.getCertificate(certId);
+  let metadataCid: string;
+  let fileCidOnChain: string;
+  let onChainHash: string;
+  let issuer: string;
+  let version: bigint;
+  let replacesCertId: string;
+  let issuedAt: bigint;
+  let revoked: boolean;
+  try {
+    [metadataCid, fileCidOnChain, onChainHash, issuer, version, replacesCertId, issuedAt, revoked] =
+      await contract.getCertificate(certId);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    if (msg.toLowerCase().includes("certificate not found")) {
+      console.log("Certificate does not exist");
+      return;
+    }
+    throw e;
+  }
 
   console.log("certId   :", certId);
   console.log("metadata :", metadataCid);
@@ -26,13 +43,6 @@ async function main() {
   console.log("replaces :", replacesCertId);
   console.log("issuedAt :", Number(issuedAt));
   console.log("revoked  :", revoked);
-  console.log("exists   :", exists);
-
-  if (!exists) {
-    console.log("Certificate does not exist");
-    return;
-  }
-
   if (revoked) {
     console.log("Certificate is REVOKED");
     return;

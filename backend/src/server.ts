@@ -92,7 +92,7 @@ const CERTIFICATE_REGISTRY_ABI = [
   "function revokeCertificate(string certId)",
   "function setIssuer(address issuer, bool allowed)",
   "function authorizedIssuers(address issuer) view returns (bool)",
-  "event CertificateIssued(string indexed certId, string cid, address indexed issuer, uint256 version, string replacesCertId, uint256 issuedAt)",
+  "event CertificateIssued(string indexed certId, string metadataCid, address indexed issuer, uint256 version, string replacesCertId, uint256 issuedAt)",
   "event CertificateRevoked(string indexed certId, address indexed issuer, uint256 revokedAt)",
 ];
 
@@ -136,11 +136,18 @@ const contractNetworkName = process.env.CONTRACT_NETWORK_NAME || "localhost";
 const supabaseUrl = (process.env.SUPABASE_URL || "").trim().replace(/\/+$/, "");
 const supabaseServiceRoleKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
 const useSupabaseIndexer = Boolean(supabaseUrl && supabaseServiceRoleKey);
+const relayTxModeEnabled = /^(1|true|yes|on)$/i.test(
+  (process.env.ENABLE_RELAY_TX_MODE || "").trim()
+);
 
 if ((supabaseUrl && !supabaseServiceRoleKey) || (!supabaseUrl && supabaseServiceRoleKey)) {
   console.warn(
     "Supabase indexer not enabled: set both SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY"
   );
+}
+
+if (!relayTxModeEnabled) {
+  console.log("Relay tx routes disabled (wallet-native mode). Set ENABLE_RELAY_TX_MODE=true to enable.");
 }
 
 const certificateIndexStateDir = path.join(workspaceRoot, "backend", ".indexer");
@@ -555,6 +562,11 @@ function describeAxiosError(err: unknown): string {
   return anyErr?.message || String(err);
 }
 
+function isCertificateNotFoundError(err: unknown): boolean {
+  const message = String((err as any)?.shortMessage || (err as any)?.message || err || "").toLowerCase();
+  return message.includes("certificate not found");
+}
+
 async function rebuildCertificateIndexFromEvents(): Promise<void> {
   certificateIndexCache.clear();
   certificateIndexLastIndexedBlock = certificateIndexStartBlock - 1;
@@ -831,17 +843,15 @@ async function enrichEntryFromContract(contract: Contract, entry: CertificateInd
       boolean,
     ];
 
-    if (cert[8]) {
-      entry.metadataCid = cert[0];
-      entry.cid = cert[0];
-      entry.fileCid = cert[1];
-      entry.fileHash = String(cert[2] || "").toLowerCase();
-      entry.issuer = String(cert[3] || "").toLowerCase();
-      entry.version = Number(cert[4] || 0n);
-      entry.replacesCertId = cert[5] || "";
-      entry.issuedAt = Number(cert[6] || 0n);
-      entry.revoked = Boolean(cert[7]);
-    }
+    entry.metadataCid = cert[0];
+    entry.cid = cert[0];
+    entry.fileCid = cert[1];
+    entry.fileHash = String(cert[2] || "").toLowerCase();
+    entry.issuer = String(cert[3] || "").toLowerCase();
+    entry.version = Number(cert[4] || 0n);
+    entry.replacesCertId = cert[5] || "";
+    entry.issuedAt = Number(cert[6] || 0n);
+    entry.revoked = Boolean(cert[7]);
   } catch {
     // Keep event-derived values if contract read fails.
   }
@@ -1122,8 +1132,20 @@ function createRelaySignerOrRespond(res: express.Response): Wallet | null {
   return new Wallet(issuerPrivateKey, provider);
 }
 
+function requireRelayTxModeEnabled(res: express.Response): boolean {
+  if (relayTxModeEnabled) return true;
+  res.status(404).json({
+    error: "Relay tx mode is disabled",
+    hint: "Use wallet-native issuance/revocation, or set ENABLE_RELAY_TX_MODE=true.",
+  });
+  return false;
+}
+
 app.get("/health", (_req, res) => {
-  res.json({ ok: true });
+  res.json({
+    ok: true,
+    relayTxModeEnabled,
+  });
 });
 
 /**
@@ -1330,7 +1352,7 @@ app.get("/api/verify/:certId", verifyRateLimiter, async (req, res) => {
     const provider = new JsonRpcProvider(rpcUrl);
     const contract = new Contract(contractAddress, CERTIFICATE_REGISTRY_ABI, provider);
 
-    const [metadataCid, fileCidOnChain, onChainHash, issuer, version, replacesCertId, issuedAt, revoked, exists] =
+    const [metadataCid, fileCidOnChain, onChainHash, issuer, version, replacesCertId, issuedAt, revoked] =
       (await contract.getFunction("getCertificate").staticCall(certId)) as [
         string,
         string,
@@ -1340,17 +1362,8 @@ app.get("/api/verify/:certId", verifyRateLimiter, async (req, res) => {
         string,
         bigint,
         boolean,
-        boolean,
       ];
     metadataCidForError = metadataCid;
-
-    if (!exists) {
-      return res.status(404).json({
-        certId,
-        exists: false,
-        status: "NOT_FOUND",
-      });
-    }
 
     const metadata = await fetchCidJson<PinnedMetadata>(metadataCid);
     const metadataFileCid = String(metadata?.fileCid || "").trim();
@@ -1393,6 +1406,14 @@ app.get("/api/verify/:certId", verifyRateLimiter, async (req, res) => {
       status: integrityMatch && !revoked ? "VALID" : revoked ? "REVOKED" : "TAMPERED",
     });
   } catch (err: any) {
+    if (isCertificateNotFoundError(err)) {
+      return res.status(404).json({
+        certId: req.params.certId,
+        exists: false,
+        status: "NOT_FOUND",
+      });
+    }
+
     if (err instanceof GatewayFetchError) {
       return res.status(502).json({
         error: "Gateway fetch failed during verification",
@@ -1552,6 +1573,8 @@ app.get("/api/certificates/:certId/history", async (req, res) => {
  */
 app.post("/api/issue", async (req, res) => {
   try {
+    if (!requireRelayTxModeEnabled(res)) return;
+
     const auth = await ensureJwtAddressIsAuthorizedIssuer(req, res);
     if (!auth) return;
 
@@ -1596,26 +1619,20 @@ app.post("/api/issue", async (req, res) => {
     }
 
     const readContract = getReadOnlyContract();
-    const existingCert = (await readContract.getFunction("getCertificate").staticCall(certId)) as [
-      string,
-      string,
-      string,
-      string,
-      bigint,
-      string,
-      bigint,
-      boolean,
-      boolean,
-    ];
-    if (existingCert[8]) {
+    try {
+      await readContract.getFunction("getCertificate").staticCall(certId);
       return res.status(409).json({
         error: "Certificate already exists",
         certId,
       });
+    } catch (err) {
+      if (!isCertificateNotFoundError(err)) {
+        throw err;
+      }
     }
 
     if (version > 1) {
-      const replacedCert = (await readContract.getFunction("getCertificate").staticCall(replacesCertId)) as [
+      let replacedCert: [
         string,
         string,
         string,
@@ -1626,18 +1643,39 @@ app.post("/api/issue", async (req, res) => {
         boolean,
         boolean,
       ];
-
-      const replacedExists = replacedCert[8];
-      const replacedRevoked = replacedCert[7];
-      if (!replacedExists) {
-        return res.status(400).json({
-          error: "Replaced certificate not found",
-          replacesCertId,
-        });
+      try {
+        replacedCert = (await readContract.getFunction("getCertificate").staticCall(replacesCertId)) as [
+          string,
+          string,
+          string,
+          string,
+          bigint,
+          string,
+          bigint,
+          boolean,
+          boolean,
+        ];
+      } catch (err) {
+        if (isCertificateNotFoundError(err)) {
+          return res.status(400).json({
+            error: "Replaced certificate not found",
+            replacesCertId,
+          });
+        }
+        throw err;
       }
+
+      const replacedRevoked = replacedCert[7];
+      const replacedIssuer = String(replacedCert[3] || "").toLowerCase();
       if (!replacedRevoked) {
         return res.status(400).json({
           error: "Replaced certificate must be revoked before issuing a replacement",
+          replacesCertId,
+        });
+      }
+      if (replacedIssuer !== auth.address.toLowerCase()) {
+        return res.status(403).json({
+          error: "Only original issuer can replace this certificate",
           replacesCertId,
         });
       }
@@ -1731,6 +1769,8 @@ app.post("/api/issue", async (req, res) => {
  */
 app.post("/api/revoke", async (req, res) => {
   try {
+    if (!requireRelayTxModeEnabled(res)) return;
+
     const auth = await ensureJwtAddressIsAuthorizedIssuer(req, res);
     if (!auth) return;
 
@@ -1781,6 +1821,8 @@ app.post("/api/revoke", async (req, res) => {
  */
 app.post("/api/admin/issuer", async (req, res) => {
   try {
+    if (!requireRelayTxModeEnabled(res)) return;
+
     const auth = await ensureJwtAddressIsAuthorizedIssuer(req, res);
     if (!auth) return;
 

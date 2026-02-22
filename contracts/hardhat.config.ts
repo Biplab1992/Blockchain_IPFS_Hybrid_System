@@ -1,5 +1,6 @@
 import { defineConfig } from "hardhat/config";
 import hardhatEthers from "@nomicfoundation/hardhat-ethers";
+import hardhatMocha from "@nomicfoundation/hardhat-mocha";
 import hardhatVerify from "@nomicfoundation/hardhat-verify";
 import fs from "fs";
 import path from "path";
@@ -45,7 +46,7 @@ const etherscanApiKey = mergedEnv.ETHERSCAN_API_KEY;
 
 export default defineConfig({
   solidity: "0.8.20",
-  plugins: [hardhatEthers, hardhatVerify],
+  plugins: [hardhatEthers, hardhatMocha, hardhatVerify],
   networks: {
     localhost: {
       type: "http",

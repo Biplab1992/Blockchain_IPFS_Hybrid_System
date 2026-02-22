@@ -21,7 +21,7 @@ contract CertificateRegistry {
 
     event CertificateIssued(
         string indexed certId,
-        string cid,
+        string metadataCid,
         address indexed issuer,
         uint256 version,
         string replacesCertId,
@@ -69,9 +69,11 @@ contract CertificateRegistry {
 
         bool isReplacement = bytes(replacesCertId).length > 0;
         if (isReplacement) {
+            Certificate storage replacedCert = certificates[replacesCertId];
             require(version > 1, "replacement version must be > 1");
-            require(certificates[replacesCertId].exists, "replaced certificate not found");
-            require(certificates[replacesCertId].revoked, "replaced certificate must be revoked");
+            require(replacedCert.exists, "replaced certificate not found");
+            require(replacedCert.revoked, "replaced certificate must be revoked");
+            require(replacedCert.issuer == msg.sender, "Only original issuer can replace");
         } else {
             require(version == 1, "new certificate must start at version 1");
         }
@@ -98,10 +100,13 @@ contract CertificateRegistry {
         );
     }
 
-    function revokeCertificate(string calldata certId) external onlyAuthorizedIssuer {
-        require(certificates[certId].exists, "Certificate not found");
+    function revokeCertificate(string calldata certId) external {
+        Certificate storage cert = certificates[certId];
+        require(cert.exists, "Certificate not found");
+        require(!cert.revoked, "Certificate already revoked");
+        require(msg.sender == owner || msg.sender == cert.issuer, "Not certificate issuer or owner");
 
-        certificates[certId].revoked = true;
+        cert.revoked = true;
         emit CertificateRevoked(certId, msg.sender, block.timestamp);
     }
 
@@ -111,6 +116,7 @@ contract CertificateRegistry {
         returns (string memory, string memory, bytes32, address, uint256, string memory, uint256, bool, bool)
     {
         Certificate memory c = certificates[certId];
+        require(c.exists, "Certificate not found");
         return (
             c.metadataCid,
             c.fileCid,
