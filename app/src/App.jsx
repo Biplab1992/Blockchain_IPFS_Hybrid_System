@@ -2,7 +2,32 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, Navigate, Route, Routes } from "react-router-dom";
 import { BrowserProvider, Contract } from "ethers";
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || "http://localhost:5050";
+function isLoopbackHost(hostname) {
+  const normalized = String(hostname || "").toLowerCase();
+  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
+}
+
+function resolveApiBase() {
+  const configured = String(import.meta.env.VITE_API_BASE_URL || "").trim();
+  const pageHost = typeof window !== "undefined" ? window.location.hostname : "localhost";
+
+  if (!configured) {
+    return `http://${pageHost}:5050`;
+  }
+
+  try {
+    const parsed = new URL(configured);
+    // If app is opened via LAN IP but API is configured as localhost, switch to page host.
+    if (!isLoopbackHost(pageHost) && isLoopbackHost(parsed.hostname)) {
+      parsed.hostname = pageHost;
+    }
+    return parsed.toString().replace(/\/+$/, "");
+  } catch {
+    return configured.replace(/\/+$/, "");
+  }
+}
+
+const API_BASE = resolveApiBase();
 const CONTRACT_ADDRESS = import.meta.env.VITE_CONTRACT_ADDRESS || "0x5FbDB2315678afecb367f032d93F642f64180aa3";
 const RPC_URL = import.meta.env.VITE_RPC_URL || "http://127.0.0.1:8545";
 const REQUIRED_CHAIN_ID = Number(import.meta.env.VITE_CHAIN_ID || 31337);
@@ -16,7 +41,21 @@ const CONTRACT_ABI = [
 ];
 
 async function apiJson(url, options = {}) {
-  const response = await fetch(url, options);
+  const { timeoutMs = 20000, ...fetchOptions } = options;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  let response;
+  try {
+    response = await fetch(url, { ...fetchOptions, signal: controller.signal });
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      throw new Error("Request timed out. Please try again.");
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
   const text = await response.text();
   let parsed = {};
   if (text) {
@@ -75,6 +114,30 @@ async function assertContractDeployed(provider) {
     throw new Error(
       `No contract bytecode at ${CONTRACT_ADDRESS} on chain ${REQUIRED_CHAIN_ID}. Check VITE_CONTRACT_ADDRESS / network.`
     );
+  }
+}
+
+function buildVerifyUrl(certId) {
+  const safeId = String(certId || "").trim();
+  const origin = typeof window !== "undefined" ? window.location.origin : "http://localhost:5173";
+  return `${origin}/verify?certId=${encodeURIComponent(safeId)}`;
+}
+
+function buildQrCodeImageUrl(data) {
+  return `https://api.qrserver.com/v1/create-qr-code/?size=240x240&margin=8&data=${encodeURIComponent(data)}`;
+}
+
+function isLikelyPublicVerifyUrl(url) {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    if (host === "localhost" || host === "127.0.0.1" || host === "::1") return false;
+    if (/^10\./.test(host)) return false;
+    if (/^192\.168\./.test(host)) return false;
+    if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(host)) return false;
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -267,10 +330,33 @@ function IssuePage({ ensureWallet }) {
         replacesCertId.trim()
       );
       const receipt = await tx.wait();
+      let indexed = false;
+      try {
+        await apiJson(`${API_BASE}/api/indexer/upsert-cert`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            certId: certId.trim(),
+            issueTxHash: receipt?.hash || tx.hash,
+            issueBlockNumber: receipt?.blockNumber || null,
+          }),
+          timeoutMs: 30000,
+        });
+        indexed = true;
+      } catch {
+        indexed = false;
+      }
 
       setResult({
-        certId,
+        certId: certId.trim(),
         metadataCid,
+        fileCid,
+        fileHash,
+        indexed,
+        verifyUrl: String(pinResp.verificationUrl || "").trim() || buildVerifyUrl(certId),
+        qrCodeImageUrl: buildQrCodeImageUrl(String(pinResp.verificationUrl || "").trim() || buildVerifyUrl(certId)),
         txHash: receipt?.hash || tx.hash,
         issuer: address,
       });
@@ -338,8 +424,13 @@ function IssuePage({ ensureWallet }) {
 
   return (
     <section className="card">
-      <h1>Issue Certificate</h1>
-      <p className="sub">Wallet-native issue flow. Backend is used for IPFS pinning only.</p>
+      <div className="title-row">
+        <h1>Issue Certificate</h1>
+        <div className="info-wrap">
+          <span className="info-button" aria-label="About issue flow" tabIndex={0}>i</span>
+          <div className="info-tooltip">Wallet-native issue flow. Backend is used for IPFS pinning only.</div>
+        </div>
+      </div>
 
       <form className="form" onSubmit={onSubmit}>
         <label>
@@ -383,14 +474,36 @@ function IssuePage({ ensureWallet }) {
           <h2>Issued</h2>
           <p><strong>certId:</strong> {result.certId}</p>
           <p><strong>metadataCid:</strong> {result.metadataCid}</p>
+          <p><strong>fileCid:</strong> {result.fileCid}</p>
+          <p><strong>fileHash:</strong> {result.fileHash}</p>
+          <p><strong>Indexed to Supabase:</strong> {result.indexed ? "true" : "pending"}</p>
           <p><strong>txHash:</strong> {result.txHash}</p>
+          <p>
+            <strong>Verify URL:</strong>{" "}
+            <a href={result.verifyUrl} target="_blank" rel="noreferrer">
+              {result.verifyUrl}
+            </a>
+          </p>
+          <p>
+            <strong>QR Reachability:</strong>{" "}
+            {isLikelyPublicVerifyUrl(result.verifyUrl) ? "Public (any network)" : "Local/LAN only"}
+          </p>
+          <div className="qr-block">
+            <img className="qr-image" src={result.qrCodeImageUrl} alt={`Verification QR for ${result.certId}`} />
+            <p className="sub">Scan to open verification page with certId prefilled.</p>
+          </div>
         </div>
       ) : null}
 
       <hr className="section-divider" />
 
-      <h2>Revoke Certificate</h2>
-      <p className="sub">Wallet-native revoke by certificate ID.</p>
+      <div className="title-row">
+        <h2>Revoke Certificate</h2>
+        <div className="info-wrap">
+          <span className="info-button" aria-label="About revoke flow" tabIndex={0}>i</span>
+          <div className="info-tooltip">Wallet-native revoke by certificate ID.</div>
+        </div>
+      </div>
       <form className="form" onSubmit={onRevoke}>
         <label>
           Certificate ID
@@ -412,8 +525,13 @@ function IssuePage({ ensureWallet }) {
 
       <hr className="section-divider" />
 
-      <h2>Issuer Admin Panel</h2>
-      <p className="sub">Owner-only action on contract: add/remove authorized issuers.</p>
+      <div className="title-row">
+        <h2>Issuer Admin Panel</h2>
+        <div className="info-wrap">
+          <span className="info-button" aria-label="About issuer admin panel" tabIndex={0}>i</span>
+          <div className="info-tooltip">Owner-only action on contract: add/remove authorized issuers.</div>
+        </div>
+      </div>
       <div className="form">
         <label>
           Issuer Wallet Address
@@ -455,30 +573,55 @@ function VerifyPage() {
   const [history, setHistory] = useState(null);
   const [historyError, setHistoryError] = useState("");
 
-  async function onSubmit(event) {
-    event.preventDefault();
+  async function runVerification(targetCertId) {
+    const certIdValue = String(targetCertId || "").trim();
+    if (!certIdValue) {
+      setError("Certificate ID is required.");
+      return;
+    }
+
     setError("");
     setResult(null);
     setHistory(null);
     setHistoryError("");
     setLoading(true);
     try {
-      const encodedCertId = encodeURIComponent(certId);
-      const [verifyResp, historyResp] = await Promise.all([
-        apiJson(`${API_BASE}/api/verify/${encodedCertId}`),
-        apiJson(`${API_BASE}/api/certificates/${encodedCertId}/history`).catch((historyErr) => {
-          setHistoryError(historyErr.message || String(historyErr));
-          return null;
-        }),
-      ]);
+      const encodedCertId = encodeURIComponent(certIdValue);
+      const verifyResp = await apiJson(`${API_BASE}/api/verify/${encodedCertId}`, {
+        timeoutMs: 70000,
+      });
       setResult(verifyResp);
-      setHistory(historyResp);
+
+      void apiJson(`${API_BASE}/api/certificates/${encodedCertId}/history`, {
+        timeoutMs: 15000,
+      })
+        .then((historyResp) => {
+          setHistory(historyResp);
+        })
+        .catch((historyErr) => {
+          setHistoryError(historyErr.message || String(historyErr));
+        });
     } catch (verifyError) {
       setError(verifyError.message || String(verifyError));
     } finally {
       setLoading(false);
     }
   }
+
+  async function onSubmit(event) {
+    event.preventDefault();
+    await runVerification(certId);
+  }
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const queryCertId = String(params.get("certId") || "").trim();
+    if (!queryCertId) return;
+    setCertId(queryCertId);
+    void runVerification(queryCertId);
+    // Intentionally run once on first render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const statusClass =
     result?.status === "VALID"
@@ -489,8 +632,13 @@ function VerifyPage() {
 
   return (
     <section className="card">
-      <h1>Verify Certificate</h1>
-      <p className="sub">Public route. Verify on-chain hash and metadata.</p>
+      <div className="title-row">
+        <h1>Verify Certificate</h1>
+        <div className="info-wrap">
+          <span className="info-button" aria-label="About verification" tabIndex={0}>i</span>
+          <div className="info-tooltip">Public route. Verify on-chain hash and metadata.</div>
+        </div>
+      </div>
 
       <form className="form" onSubmit={onSubmit}>
         <label>

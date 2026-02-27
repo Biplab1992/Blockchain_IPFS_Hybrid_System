@@ -6,9 +6,11 @@ import dotenv from "dotenv";
 import axios from "axios";
 import crypto from "crypto";
 import FormData from "form-data";
+import { PDFDocument } from "pdf-lib";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import fs from "fs";
+import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
 import jwt from "jsonwebtoken";
@@ -29,12 +31,43 @@ const corsOrigins = (process.env.CORS_ORIGINS || "http://localhost:3000,http://l
   .map((o) => o.trim())
   .filter(Boolean);
 
+function isLocalDevOrigin(origin: string): boolean {
+  try {
+    const parsed = new URL(origin);
+    if (!["http:", "https:"].includes(parsed.protocol)) return false;
+    if (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1" || parsed.hostname === "::1") {
+      return true;
+    }
+
+    const isPrivateIpv4 =
+      /^10\./.test(parsed.hostname) ||
+      /^192\.168\./.test(parsed.hostname) ||
+      /^172\.(1[6-9]|2\d|3[0-1])\./.test(parsed.hostname);
+    return isPrivateIpv4;
+  } catch {
+    return false;
+  }
+}
+
+function getPreferredLanIpv4(): string | null {
+  const nets = os.networkInterfaces();
+  for (const entries of Object.values(nets)) {
+    for (const net of entries || []) {
+      if (net.family !== "IPv4" || net.internal) continue;
+      if (/^10\./.test(net.address) || /^192\.168\./.test(net.address) || /^172\.(1[6-9]|2\d|3[0-1])\./.test(net.address)) {
+        return net.address;
+      }
+    }
+  }
+  return null;
+}
+
 app.disable("x-powered-by");
 app.use(helmet());
 app.use(cors({
   origin: (origin, callback) => {
     if (!origin) return callback(null, true);
-    if (corsOrigins.includes(origin)) return callback(null, true);
+    if (corsOrigins.includes(origin) || isLocalDevOrigin(origin)) return callback(null, true);
     return callback(new Error("Origin not allowed by CORS"));
   },
   methods: ["GET", "POST", "OPTIONS"],
@@ -79,6 +112,45 @@ function sha256Hex(buffer: Buffer) {
 
 function sha256Hex0x(buffer: Buffer) {
   return `0x${sha256Hex(buffer)}`;
+}
+
+type EmbeddedPdfMetadata = {
+  certId: string;
+  title: string;
+  recipient: string;
+  version: number;
+  replacesCertId: string;
+  verificationUrl: string;
+  sourceHash: string;
+  embeddedAtIso: string;
+};
+
+async function embedVerificationMetadataInPdf(input: Buffer, metadata: EmbeddedPdfMetadata): Promise<Buffer> {
+  const pdf = await PDFDocument.load(input, {
+    ignoreEncryption: true,
+    updateMetadata: true,
+  });
+
+  const subject = `CertChain Verification | certId=${metadata.certId || "N/A"}`;
+  const keywords = [
+    `certId:${metadata.certId || ""}`,
+    `recipient:${metadata.recipient || ""}`,
+    `version:${metadata.version}`,
+    `replaces:${metadata.replacesCertId || ""}`,
+    `verify:${metadata.verificationUrl}`,
+    `sourceHash:${metadata.sourceHash}`,
+  ].filter(Boolean);
+
+  if (metadata.title) pdf.setTitle(metadata.title);
+  if (metadata.recipient) pdf.setAuthor(metadata.recipient);
+  pdf.setSubject(subject);
+  pdf.setProducer("CertChain Backend");
+  pdf.setCreator("CertChain Verification Pipeline");
+  pdf.setCreationDate(new Date(metadata.embeddedAtIso));
+  pdf.setModificationDate(new Date(metadata.embeddedAtIso));
+  pdf.setKeywords(keywords);
+
+  return Buffer.from(await pdf.save());
 }
 
 const __filename = fileURLToPath(import.meta.url);
@@ -467,6 +539,13 @@ function toSingleString(value: string | string[] | undefined): string {
   return value || "";
 }
 
+function canonicalizeDemoCertId(certId: string): string {
+  const match = certId.trim().match(/^demo-cert-(\d+)$/i);
+  if (!match) return certId.trim();
+  const padded = String(match[1]).padStart(3, "0");
+  return `Demo-cert-${padded}`;
+}
+
 function isEventLog(log: unknown): log is EventLog {
   return Boolean(log && typeof log === "object" && "args" in (log as Record<string, unknown>));
 }
@@ -565,6 +644,57 @@ function describeAxiosError(err: unknown): string {
 function isCertificateNotFoundError(err: unknown): boolean {
   const message = String((err as any)?.shortMessage || (err as any)?.message || err || "").toLowerCase();
   return message.includes("certificate not found");
+}
+
+function isRpcQuotaError(err: unknown): boolean {
+  const message = String((err as any)?.shortMessage || (err as any)?.message || err || "").toLowerCase();
+  return (
+    message.includes("daily request limit reached") ||
+    message.includes("request limit reached") ||
+    message.includes("rate limit")
+  );
+}
+
+async function loadCertificateEntryFromChain(
+  contract: Contract,
+  certId: string,
+  opts?: { issueTxHash?: string; issueBlockNumber?: number | null; revokeTxHash?: string | null; revokeBlockNumber?: number | null }
+): Promise<CertificateIndexEntry> {
+  const cert = (await contract.getFunction("getCertificate").staticCall(certId)) as [
+    string,
+    string,
+    string,
+    string,
+    bigint,
+    string,
+    bigint,
+    boolean,
+    boolean,
+  ];
+
+  return {
+    certId,
+    cid: String(cert[0] || ""),
+    metadataCid: String(cert[0] || ""),
+    fileCid: String(cert[1] || ""),
+    fileHash: String(cert[2] || "").toLowerCase(),
+    issuer: String(cert[3] || "").toLowerCase(),
+    version: Number(cert[4] || 0),
+    replacesCertId: String(cert[5] || ""),
+    issuedAt: Number(cert[6] || 0),
+    revoked: Boolean(cert[7]),
+    revokedAt: null,
+    issueTxHash: String(opts?.issueTxHash || "").trim(),
+    revokeTxHash: opts?.revokeTxHash ?? null,
+    issueBlockNumber:
+      Number.isFinite(opts?.issueBlockNumber as number) && Number(opts?.issueBlockNumber) > 0
+        ? Number(opts?.issueBlockNumber)
+        : 0,
+    revokeBlockNumber:
+      Number.isFinite(opts?.revokeBlockNumber as number) && Number(opts?.revokeBlockNumber) > 0
+        ? Number(opts?.revokeBlockNumber)
+        : null,
+  };
 }
 
 async function rebuildCertificateIndexFromEvents(): Promise<void> {
@@ -739,6 +869,8 @@ async function persistCertificates(entries: CertificateIndexEntry[]): Promise<vo
       return;
     } catch (err: any) {
       console.error("Supabase certificates upsert failed:", describeAxiosError(err));
+      // Do not advance index state when persistence fails, otherwise rows are skipped permanently.
+      throw err;
     }
   }
 }
@@ -948,7 +1080,11 @@ async function syncCertificateIndexToLatest(): Promise<void> {
         if (!certId) {
           certId = await resolveCertIdFromTx(contract, log.transactionHash, "issueCertificate");
         }
-        if (!certId) continue;
+        if (!certId) {
+          throw new Error(
+            `Unable to resolve certId for CertificateIssued tx ${log.transactionHash} at block ${log.blockNumber}`
+          );
+        }
         certificateIndexCache.set(certId, {
           certId,
           cid: String(log.args?.[1] ?? ""),
@@ -972,7 +1108,11 @@ async function syncCertificateIndexToLatest(): Promise<void> {
         if (!certId) {
           certId = await resolveCertIdFromTx(contract, log.transactionHash, "revokeCertificate");
         }
-        if (!certId) continue;
+        if (!certId) {
+          throw new Error(
+            `Unable to resolve certId for CertificateRevoked tx ${log.transactionHash} at block ${log.blockNumber}`
+          );
+        }
 
         const current = certificateIndexCache.get(certId);
         if (current) {
@@ -1262,15 +1402,65 @@ app.post("/api/pin", pinRateLimiter, upload.single("file"), async (req, res) => 
     const jwt = process.env.PINATA_JWT;
     if (!jwt) return res.status(500).json({ error: "PINATA_JWT not set" });
 
-    const fileHash = sha256Hex(req.file.buffer);
-    const fileCid = await pinBufferToIpfs(req.file.buffer, req.file.originalname, jwt, req.file.originalname);
-
     const certId = String(req.body?.certId || "").trim();
     const title = String(req.body?.title || "").trim();
     const recipient = String(req.body?.recipient || "").trim();
     const replacesCertId = String(req.body?.replacesCertId || "").trim();
     const versionRaw = Number(req.body?.version);
     const version = Number.isFinite(versionRaw) && versionRaw > 0 ? Math.floor(versionRaw) : 1;
+    const requestOrigin = String(req.headers.origin || "").trim();
+    const hasExplicitVerifyBase = Boolean(
+      String(process.env.PUBLIC_VERIFY_BASE_URL || process.env.APP_VERIFY_BASE_URL || "").trim()
+    );
+    let appVerifyBaseUrl = String(
+      process.env.PUBLIC_VERIFY_BASE_URL || process.env.APP_VERIFY_BASE_URL || ""
+    ).trim();
+    if (!appVerifyBaseUrl && requestOrigin) {
+      appVerifyBaseUrl = `${requestOrigin.replace(/\/+$/, "")}/verify`;
+    }
+    if (!appVerifyBaseUrl) {
+      const lanIp = getPreferredLanIpv4();
+      appVerifyBaseUrl = lanIp ? `http://${lanIp}:5173/verify` : "http://localhost:5173/verify";
+    }
+    appVerifyBaseUrl = appVerifyBaseUrl.replace(/\/+$/, "");
+    const verificationUrl = `${appVerifyBaseUrl}?certId=${encodeURIComponent(certId)}`;
+    if (!hasExplicitVerifyBase && verificationUrl.includes("localhost")) {
+      console.warn(
+        "Verification URL uses localhost. Set PUBLIC_VERIFY_BASE_URL for mobile scanning."
+      );
+    }
+    const sourceHash = `0x${sha256Hex(req.file.buffer)}`;
+    const embeddedAtIso = new Date().toISOString();
+
+    let pdfBytesForPinning = req.file.buffer;
+    let pdfMetadataEmbedded = false;
+    let pdfMetadataEmbedError = "";
+    try {
+      if (req.file.mimetype === "application/pdf") {
+        pdfBytesForPinning = await embedVerificationMetadataInPdf(req.file.buffer, {
+          certId,
+          title,
+          recipient,
+          version,
+          replacesCertId,
+          verificationUrl,
+          sourceHash,
+          embeddedAtIso,
+        });
+        pdfMetadataEmbedded = true;
+      }
+    } catch (embedErr: any) {
+      pdfMetadataEmbedError = embedErr?.message || String(embedErr);
+      console.warn("PDF metadata embedding failed, continuing with original file:", pdfMetadataEmbedError);
+    }
+
+    const fileHash = sha256Hex(pdfBytesForPinning);
+    const fileCid = await pinBufferToIpfs(
+      pdfBytesForPinning,
+      req.file.originalname,
+      jwt,
+      req.file.originalname
+    );
 
     const metadataDoc: PinnedMetadata = {
       certId,
@@ -1282,8 +1472,24 @@ app.post("/api/pin", pinRateLimiter, upload.single("file"), async (req, res) => 
       replacesCertId,
       sourceFileName: req.file.originalname,
       sourceFileType: req.file.mimetype,
-      createdAt: new Date().toISOString(),
+      createdAt: embeddedAtIso,
+      verificationUrl,
+      sourceHash,
+      pdfMetadataEmbedded,
+      embeddedPdfMetadata: {
+        certId,
+        title,
+        recipient,
+        version,
+        replacesCertId,
+        verificationUrl,
+        sourceHash,
+        embeddedAtIso,
+      },
     };
+    if (pdfMetadataEmbedError) {
+      metadataDoc.pdfMetadataEmbedError = pdfMetadataEmbedError;
+    }
 
     const metadataCid = await pinJsonToIpfs(
       metadataDoc,
@@ -1295,6 +1501,10 @@ app.post("/api/pin", pinRateLimiter, upload.single("file"), async (req, res) => 
       metadataCid,
       fileCid,
       fileHash: `0x${fileHash}`,
+      verificationUrl,
+      sourceHash,
+      pdfMetadataEmbedded,
+      pdfMetadataEmbedError: pdfMetadataEmbedError || null,
       metadata: metadataDoc,
       // Backward-compat alias
       cid: fileCid,
@@ -1344,25 +1554,43 @@ app.get("/api/verify/:certId", verifyRateLimiter, async (req, res) => {
   let fileCidForError: string | undefined;
 
   try {
-    const certId = toSingleString(req.params.certId).trim();
-    if (!certId) return res.status(400).json({ error: "certId is required" });
+    const requestedCertId = toSingleString(req.params.certId).trim();
+    if (!requestedCertId) return res.status(400).json({ error: "certId is required" });
+    const certIdCandidates = Array.from(
+      new Set([requestedCertId, canonicalizeDemoCertId(requestedCertId)])
+    );
 
     const rpcUrl = resolveRpcUrl();
     const contractAddress = loadDeploymentAddress();
     const provider = new JsonRpcProvider(rpcUrl);
     const contract = new Contract(contractAddress, CERTIFICATE_REGISTRY_ABI, provider);
 
-    const [metadataCid, fileCidOnChain, onChainHash, issuer, version, replacesCertId, issuedAt, revoked] =
-      (await contract.getFunction("getCertificate").staticCall(certId)) as [
-        string,
-        string,
-        string,
-        string,
-        bigint,
-        string,
-        bigint,
-        boolean,
-      ];
+    let certId = requestedCertId;
+    let chainTuple:
+      | [string, string, string, string, bigint, string, bigint, boolean]
+      | null = null;
+    let lastErr: unknown = null;
+    for (const candidate of certIdCandidates) {
+      try {
+        chainTuple = (await contract.getFunction("getCertificate").staticCall(candidate)) as [
+          string,
+          string,
+          string,
+          string,
+          bigint,
+          string,
+          bigint,
+          boolean,
+        ];
+        certId = candidate;
+        break;
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    if (!chainTuple) throw lastErr;
+
+    const [metadataCid, fileCidOnChain, onChainHash, issuer, version, replacesCertId, issuedAt, revoked] = chainTuple;
     metadataCidForError = metadataCid;
 
     const metadata = await fetchCidJson<PinnedMetadata>(metadataCid);
@@ -1390,6 +1618,7 @@ app.get("/api/verify/:certId", verifyRateLimiter, async (req, res) => {
 
     return res.json({
       certId,
+      requestedCertId,
       exists: true,
       revoked: Boolean(revoked),
       metadataCid,
@@ -1411,6 +1640,13 @@ app.get("/api/verify/:certId", verifyRateLimiter, async (req, res) => {
         certId: req.params.certId,
         exists: false,
         status: "NOT_FOUND",
+      });
+    }
+
+    if (isRpcQuotaError(err)) {
+      return res.status(503).json({
+        error: "Verification temporarily unavailable",
+        message: "RPC provider quota/rate limit reached. Please retry shortly.",
       });
     }
 
@@ -1511,6 +1747,55 @@ app.get("/api/indexer/status", async (_req, res) => {
   } catch (err: any) {
     return res.status(500).json({
       error: "Indexer status failed",
+      message: err?.message || String(err),
+    });
+  }
+});
+
+/**
+ * Force-upsert one certificate into index cache + persistent store.
+ * Useful when provider log limits make full historical scanning slow.
+ */
+app.post("/api/indexer/upsert-cert", async (req, res) => {
+  try {
+    const certId = String(req.body?.certId || "").trim();
+    if (!certId) {
+      return res.status(400).json({ error: "certId is required" });
+    }
+    const issueTxHash = String(req.body?.issueTxHash || "").trim();
+    const issueBlockNumberRaw = Number(req.body?.issueBlockNumber);
+    const issueBlockNumber =
+      Number.isFinite(issueBlockNumberRaw) && issueBlockNumberRaw > 0
+        ? Math.floor(issueBlockNumberRaw)
+        : null;
+
+    const contract = getReadOnlyContract();
+    const entry = await loadCertificateEntryFromChain(contract, certId, {
+      issueTxHash,
+      issueBlockNumber,
+    });
+    if (!entry.issueTxHash) {
+      return res.status(422).json({
+        error: "issueTxHash is required to persist this schema",
+        certId,
+      });
+    }
+    certificateIndexCache.set(certId, entry);
+    await persistCertificates([entry]);
+    certificateIndexLastUpdatedAtMs = Date.now();
+
+    return res.json({
+      ok: true,
+      certId,
+      entry,
+    });
+  } catch (err: any) {
+    if (isCertificateNotFoundError(err)) {
+      return res.status(404).json({ error: "Certificate not found" });
+    }
+    console.error("Indexer upsert-cert failed:", err?.message || String(err));
+    return res.status(500).json({
+      error: "Indexer upsert-cert failed",
       message: err?.message || String(err),
     });
   }

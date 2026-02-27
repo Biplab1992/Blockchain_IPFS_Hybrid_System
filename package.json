@@ -5,6 +5,7 @@
   "description": "Monorepo scripts for app, backend, and contracts",
   "scripts": {
     "dev": "concurrently \"npm --prefix backend run dev\" \"npm --prefix app run dev\"",
+    "dev:all": "concurrently -n CHAIN,DEPLOY,API,UI -c blue,magenta,green,cyan \"powershell -NoProfile -Command cd contracts; npx hardhat node\" \"powershell -NoProfile -Command Start-Sleep -Seconds 6; cd contracts; npx hardhat run scripts/deploy.ts --network localhost\" \"npm --prefix backend run dev\" \"npm --prefix app run dev\"",
     "test": "npm --prefix contracts run test",
     "lint": "npm --prefix backend exec -- tsc --noEmit -p backend/tsconfig.json && npm --prefix contracts run test && npm --prefix app run build"
   },

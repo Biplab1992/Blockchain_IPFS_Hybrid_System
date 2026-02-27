@@ -166,6 +166,62 @@ a {
   letter-spacing: 0.01em;
 }
 
+.title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.info-wrap {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.info-button {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 1px solid #c4d4de;
+  background: #f6fafc;
+  color: #0e2330;
+  font-size: 0.95rem;
+  font-weight: 800;
+  cursor: pointer;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.info-tooltip {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  min-width: 260px;
+  max-width: min(72vw, 360px);
+  padding: 8px 10px;
+  border: 1px solid #c4d4de;
+  border-radius: 8px;
+  background: #f7fbfe;
+  color: #233846;
+  font-size: 0.88rem;
+  font-weight: 600;
+  box-shadow: 0 8px 20px rgba(12, 35, 50, 0.12);
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(2px);
+  transition: opacity 120ms ease, transform 120ms ease, visibility 120ms ease;
+  z-index: 10;
+}
+
+.info-wrap:hover .info-tooltip,
+.info-wrap:focus-within .info-tooltip {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0);
+}
+
 .card h2 {
   margin: 6px 0 10px;
   font-size: 1.5rem;
@@ -256,6 +312,22 @@ a {
   border: 1px solid #d6e2e8;
   border-radius: 8px;
   padding: 10px;
+}
+
+.qr-block {
+  margin-top: 12px;
+  display: grid;
+  gap: 8px;
+}
+
+.qr-image {
+  width: 220px;
+  max-width: 100%;
+  height: auto;
+  border: 1px solid #d6e2e8;
+  border-radius: 10px;
+  background: #fff;
+  padding: 8px;
 }
 
 .chain-panel {

@@ -54,7 +54,7 @@ copy contracts\.env.example contracts\.env
 ```
 
 Minimum important variables:
-- `backend/.env`: `PINATA_JWT`, `JWT_SECRET`, `RPC_URL`, `CONTRACT_NETWORK_NAME`
+- `backend/.env`: `PINATA_JWT`, `JWT_SECRET`, `RPC_URL`, `CONTRACT_NETWORK_NAME`, `PUBLIC_VERIFY_BASE_URL`
 - `contracts/.env`: `DEPLOYER_PRIVATE_KEY` (for deploy scripts using raw signer)
 - `app/.env`: `VITE_API_BASE_URL`, `VITE_CONTRACT_ADDRESS`, `VITE_CHAIN_ID`, `VITE_RPC_URL`
 
@@ -126,6 +126,25 @@ npm run dev
 ```
 
 Open `http://localhost:5173`.
+
+## Public QR Verification (Any Network)
+
+To generate QR codes that work outside your local network:
+
+1. Deploy frontend publicly (example: `https://verify.yourdomain.com`)
+2. Deploy backend publicly (example: `https://api.yourdomain.com`)
+3. Set:
+   - `backend/.env`
+     - `PUBLIC_VERIFY_BASE_URL=https://verify.yourdomain.com/verify`
+     - `CORS_ORIGINS=https://verify.yourdomain.com`
+   - `app/.env`
+     - `VITE_API_BASE_URL=https://api.yourdomain.com`
+4. Restart/redeploy backend and frontend.
+5. Issue new certificates. Newly generated QR codes will contain the public verify URL.
+
+Notes:
+- Old QR codes keep their original URL and will not change retroactively.
+- If `PUBLIC_VERIFY_BASE_URL` is not set, backend may emit a local/LAN URL depending on request origin.
 
 ## Run Tests
 
