@@ -58,6 +58,10 @@ Minimum important variables:
 - `contracts/.env`: `DEPLOYER_PRIVATE_KEY` (for deploy scripts using raw signer)
 - `app/.env`: `VITE_API_BASE_URL`, `VITE_CONTRACT_ADDRESS`, `VITE_CHAIN_ID`, `VITE_RPC_URL`
 
+If using Supabase indexer, also set:
+- `SUPABASE_URL`
+- `SUPABASE_SERVICE_ROLE_KEY`
+
 ### How To Get These Keys/Values
 
 - `RPC_URL` / `SEPOLIA_RPC_URL`:
@@ -159,6 +163,16 @@ Current test suite covers:
 - revoke permission boundaries + double revoke prevention
 - replacement/version rules including same-issuer enforcement
 - event emission correctness
+
+## Supabase Issuer Index
+
+Run the SQL in [`backend/supabase/schema.sql`](backend/supabase/schema.sql) to create:
+- `certificates`
+- `indexer_state`
+- `issuer_status`
+- `issuer_events`
+
+Issuer authorization remains on-chain. Supabase tables are index/audit copies populated from `IssuerAuthorizationUpdated` events.
 
 ## End-to-End Demo Flow
 

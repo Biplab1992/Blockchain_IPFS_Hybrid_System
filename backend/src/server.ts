@@ -166,6 +166,7 @@ const CERTIFICATE_REGISTRY_ABI = [
   "function authorizedIssuers(address issuer) view returns (bool)",
   "event CertificateIssued(string indexed certId, string metadataCid, address indexed issuer, uint256 version, string replacesCertId, uint256 issuedAt)",
   "event CertificateRevoked(string indexed certId, address indexed issuer, uint256 revokedAt)",
+  "event IssuerAuthorizationUpdated(address indexed issuer, bool allowed)",
 ];
 
 type CertificateIndexEntry = {
@@ -186,6 +187,15 @@ type CertificateIndexEntry = {
   revokeBlockNumber: number | null;
 };
 
+type IssuerStatusEntry = {
+  issuer: string;
+  isAuthorized: boolean;
+  lastTxHash: string;
+  lastBlockNumber: number;
+  lastChangedAt: number;
+  changedBy: string | null;
+};
+
 const certificateIndexCache = new Map<string, CertificateIndexEntry>();
 const certificateIndexRefreshMs = Number(process.env.CERT_INDEX_REFRESH_MS || 15000);
 const certificateIndexBatchSize = Math.max(
@@ -196,13 +206,22 @@ const certificateIndexPollMs = Math.max(
   2000,
   Number(process.env.CERT_INDEX_POLL_MS || 15000)
 );
-const certificateIndexRequestDelayMs = Math.max(
-  0,
-  Number(process.env.CERT_INDEX_REQUEST_DELAY_MS || 250)
-);
 const certificateIndexStartBlock = Math.max(
   0,
   Number(process.env.CERT_INDEX_START_BLOCK || 0)
+);
+const issuerIndexRefreshMs = Number(process.env.ISSUER_INDEX_REFRESH_MS || certificateIndexRefreshMs);
+const issuerIndexPollMs = Math.max(
+  2000,
+  Number(process.env.ISSUER_INDEX_POLL_MS || certificateIndexPollMs)
+);
+const issuerIndexStartBlock = Math.max(
+  0,
+  Number(process.env.ISSUER_INDEX_START_BLOCK || certificateIndexStartBlock)
+);
+const certificateIndexRequestDelayMs = Math.max(
+  0,
+  Number(process.env.CERT_INDEX_REQUEST_DELAY_MS || 250)
 );
 const contractNetworkName = process.env.CONTRACT_NETWORK_NAME || "localhost";
 const supabaseUrl = (process.env.SUPABASE_URL || "").trim().replace(/\/+$/, "");
@@ -233,6 +252,11 @@ let certificateIndexLastIndexedBlock = certificateIndexStartBlock - 1;
 let certificateIndexBootstrapPromise: Promise<void> | null = null;
 let certificateIndexSyncPromise: Promise<void> | null = null;
 let providerMaxLogRange = certificateIndexBatchSize;
+const issuerStatusCache = new Map<string, IssuerStatusEntry>();
+let issuerIndexLastUpdatedAtMs = 0;
+let issuerIndexLastIndexedBlock = issuerIndexStartBlock - 1;
+let issuerIndexBootstrapPromise: Promise<void> | null = null;
+let issuerIndexSyncPromise: Promise<void> | null = null;
 
 type CertificateRow = {
   cert_id: string;
@@ -250,6 +274,27 @@ type CertificateRow = {
   issued_at?: number | null;
   revoked_at?: number | null;
   updated_at?: string | null;
+};
+
+type IssuerStatusRow = {
+  issuer: string;
+  is_authorized: boolean | null;
+  last_tx_hash: string | null;
+  last_block_number: number | null;
+  last_changed_at: number | null;
+  changed_by?: string | null;
+  updated_at?: string | null;
+};
+
+type IssuerEventRow = {
+  tx_hash: string;
+  log_index: number;
+  block_number: number;
+  issuer: string;
+  allowed: boolean;
+  changed_by: string | null;
+  changed_at: number | null;
+  created_at?: string | null;
 };
 
 class GatewayFetchError extends Error {
@@ -592,6 +637,29 @@ function fromCertificateRow(row: CertificateRow): CertificateIndexEntry {
   };
 }
 
+function toIssuerStatusRow(entry: IssuerStatusEntry): IssuerStatusRow {
+  return {
+    issuer: entry.issuer,
+    is_authorized: entry.isAuthorized,
+    last_tx_hash: entry.lastTxHash || null,
+    last_block_number: entry.lastBlockNumber || null,
+    last_changed_at: entry.lastChangedAt || null,
+    changed_by: entry.changedBy,
+    updated_at: new Date().toISOString(),
+  };
+}
+
+function fromIssuerStatusRow(row: IssuerStatusRow): IssuerStatusEntry {
+  return {
+    issuer: String(row.issuer || "").toLowerCase(),
+    isAuthorized: Boolean(row.is_authorized),
+    lastTxHash: String(row.last_tx_hash || ""),
+    lastBlockNumber: Number(row.last_block_number || 0),
+    lastChangedAt: Number(row.last_changed_at || 0),
+    changedBy: row.changed_by === undefined ? null : row.changed_by,
+  };
+}
+
 function getSupabaseHeaders() {
   return {
     apikey: supabaseServiceRoleKey,
@@ -724,6 +792,33 @@ async function ensureCertificateIndexFresh(): Promise<void> {
   await certificateIndexSyncPromise;
 }
 
+async function rebuildIssuerIndexFromEvents(): Promise<void> {
+  issuerStatusCache.clear();
+  issuerIndexLastIndexedBlock = issuerIndexStartBlock - 1;
+  await saveIssuerIndexerState();
+  await syncIssuerIndexToLatest();
+}
+
+async function ensureIssuerIndexFresh(): Promise<void> {
+  if (!issuerIndexBootstrapPromise) {
+    issuerIndexBootstrapPromise = bootstrapIssuerIndexer().finally(() => {
+      issuerIndexBootstrapPromise = null;
+    });
+  }
+
+  await issuerIndexBootstrapPromise;
+
+  const isFresh = Date.now() - issuerIndexLastUpdatedAtMs <= issuerIndexRefreshMs;
+  if (isFresh) return;
+
+  if (!issuerIndexSyncPromise) {
+    issuerIndexSyncPromise = syncIssuerIndexToLatest().finally(() => {
+      issuerIndexSyncPromise = null;
+    });
+  }
+  await issuerIndexSyncPromise;
+}
+
 type CertificateIndexerState = {
   networkName: string;
   contractAddress: string;
@@ -731,10 +826,10 @@ type CertificateIndexerState = {
   updatedAtIso: string;
 };
 
-function readLocalCertificateIndexerState(): CertificateIndexerState | null {
+function readLocalIndexerState(stateFile: string): CertificateIndexerState | null {
   try {
-    if (!fs.existsSync(certificateIndexStateFile)) return null;
-    const raw = fs.readFileSync(certificateIndexStateFile, "utf8");
+    if (!fs.existsSync(stateFile)) return null;
+    const raw = fs.readFileSync(stateFile, "utf8");
     const parsed = JSON.parse(raw) as Partial<CertificateIndexerState>;
     if (
       typeof parsed?.networkName !== "string" ||
@@ -757,30 +852,29 @@ function readLocalCertificateIndexerState(): CertificateIndexerState | null {
   }
 }
 
-async function saveLocalCertificateIndexerState(): Promise<void> {
+async function saveLocalIndexerState(stateFile: string, lastIndexedBlock: number): Promise<void> {
   const contractAddress = loadDeploymentAddress().toLowerCase();
   const payload: CertificateIndexerState = {
     networkName: contractNetworkName,
     contractAddress,
-    lastIndexedBlock: certificateIndexLastIndexedBlock,
+    lastIndexedBlock,
     updatedAtIso: new Date().toISOString(),
   };
 
   await fs.promises.mkdir(certificateIndexStateDir, { recursive: true });
-  await fs.promises.writeFile(
-    certificateIndexStateFile,
-    JSON.stringify(payload, null, 2),
-    "utf8"
-  );
+  await fs.promises.writeFile(stateFile, JSON.stringify(payload, null, 2), "utf8");
 }
 
-async function readSupabaseCertificateIndexerState(): Promise<CertificateIndexerState | null> {
+async function readSupabaseIndexerState(
+  stateKey: string,
+  fallbackStartBlock: number
+): Promise<CertificateIndexerState | null> {
   const rows = await supabaseRequest<Array<{ id: string; last_block: number | null }>>({
     method: "GET",
     tablePath: "indexer_state",
     params: {
       select: "id,last_block",
-      id: `eq.${contractNetworkName}`,
+      id: `eq.${stateKey}`,
       limit: "1",
     },
   });
@@ -791,24 +885,48 @@ async function readSupabaseCertificateIndexerState(): Promise<CertificateIndexer
   return {
     networkName: row.id,
     contractAddress: loadDeploymentAddress().toLowerCase(),
-    lastIndexedBlock: Math.floor(Number(row.last_block || certificateIndexStartBlock - 1)),
+    lastIndexedBlock: Math.floor(Number(row.last_block || fallbackStartBlock - 1)),
     updatedAtIso: new Date().toISOString(),
   };
 }
 
-async function saveSupabaseCertificateIndexerState(): Promise<void> {
+async function saveSupabaseIndexerState(stateKey: string, lastIndexedBlock: number): Promise<void> {
   await supabaseRequest<unknown>({
     method: "POST",
     tablePath: "indexer_state",
     params: { on_conflict: "id" },
     body: [
       {
-        id: contractNetworkName,
-        last_block: certificateIndexLastIndexedBlock,
+        id: stateKey,
+        last_block: lastIndexedBlock,
       },
     ],
     prefer: "resolution=merge-duplicates,return=minimal",
   });
+}
+
+function certificateStateKey(): string {
+  return `${contractNetworkName}:certificates`;
+}
+
+function issuerStateKey(): string {
+  return `${contractNetworkName}:issuer-auth`;
+}
+
+function readLocalCertificateIndexerState(): CertificateIndexerState | null {
+  return readLocalIndexerState(certificateIndexStateFile);
+}
+
+async function saveLocalCertificateIndexerState(): Promise<void> {
+  await saveLocalIndexerState(certificateIndexStateFile, certificateIndexLastIndexedBlock);
+}
+
+async function readSupabaseCertificateIndexerState(): Promise<CertificateIndexerState | null> {
+  return readSupabaseIndexerState(certificateStateKey(), certificateIndexStartBlock);
+}
+
+async function saveSupabaseCertificateIndexerState(): Promise<void> {
+  await saveSupabaseIndexerState(certificateStateKey(), certificateIndexLastIndexedBlock);
 }
 
 async function readCertificateIndexerState(): Promise<CertificateIndexerState | null> {
@@ -881,6 +999,96 @@ async function hydrateCacheFromPersistentStore(): Promise<void> {
     await loadSupabaseCertificatesIntoCache();
   } catch (err: any) {
     console.error("Supabase certificates bootstrap failed:", describeAxiosError(err));
+  }
+}
+
+async function readSupabaseIssuerIndexerState(): Promise<CertificateIndexerState | null> {
+  return readSupabaseIndexerState(issuerStateKey(), issuerIndexStartBlock);
+}
+
+async function saveSupabaseIssuerIndexerState(): Promise<void> {
+  await saveSupabaseIndexerState(issuerStateKey(), issuerIndexLastIndexedBlock);
+}
+
+async function readIssuerIndexerState(): Promise<CertificateIndexerState | null> {
+  if (!useSupabaseIndexer) return null;
+  try {
+    return await readSupabaseIssuerIndexerState();
+  } catch (err: any) {
+    console.error("Supabase issuer indexer_state read failed:", describeAxiosError(err));
+    return null;
+  }
+}
+
+async function saveIssuerIndexerState(): Promise<void> {
+  if (!useSupabaseIndexer) return;
+  try {
+    await saveSupabaseIssuerIndexerState();
+  } catch (err: any) {
+    console.error("Supabase issuer indexer_state write failed:", describeAxiosError(err));
+  }
+}
+
+async function upsertSupabaseIssuerStatuses(entries: IssuerStatusEntry[]): Promise<void> {
+  if (entries.length === 0) return;
+  await supabaseRequest<unknown>({
+    method: "POST",
+    tablePath: "issuer_status",
+    params: { on_conflict: "issuer" },
+    body: entries.map(toIssuerStatusRow),
+    prefer: "resolution=merge-duplicates,return=minimal",
+  });
+}
+
+async function insertSupabaseIssuerEvents(entries: IssuerEventRow[]): Promise<void> {
+  if (entries.length === 0) return;
+  await supabaseRequest<unknown>({
+    method: "POST",
+    tablePath: "issuer_events",
+    params: { on_conflict: "tx_hash,log_index" },
+    body: entries,
+    prefer: "resolution=ignore-duplicates,return=minimal",
+  });
+}
+
+async function loadSupabaseIssuerStatusesIntoCache(): Promise<void> {
+  const rows = await supabaseRequest<IssuerStatusRow[]>({
+    method: "GET",
+    tablePath: "issuer_status",
+    params: {
+      select: "*",
+      order: "last_block_number.asc",
+    },
+  });
+
+  issuerStatusCache.clear();
+  for (const row of rows) {
+    const entry = fromIssuerStatusRow(row);
+    if (!entry.issuer) continue;
+    issuerStatusCache.set(entry.issuer, entry);
+  }
+}
+
+async function persistIssuerStatusesAndEvents(
+  statuses: IssuerStatusEntry[],
+  events: IssuerEventRow[]
+): Promise<void> {
+  if (!useSupabaseIndexer) return;
+  try {
+    await upsertSupabaseIssuerStatuses(statuses);
+    await insertSupabaseIssuerEvents(events);
+  } catch (err: any) {
+    console.error("Supabase issuer status/events upsert failed:", describeAxiosError(err));
+    throw err;
+  }
+}
+
+async function hydrateIssuerCacheFromPersistentStore(): Promise<void> {
+  if (!useSupabaseIndexer) return;
+  try {
+    await loadSupabaseIssuerStatusesIntoCache();
+  } catch (err: any) {
+    console.error("Supabase issuer statuses bootstrap failed:", describeAxiosError(err));
   }
 }
 
@@ -1160,6 +1368,128 @@ async function syncCertificateIndexToLatest(): Promise<void> {
   }
 }
 
+async function syncIssuerIndexToLatest(): Promise<void> {
+  const contract = getReadOnlyContract();
+  const provider = contract.runner?.provider;
+  if (!provider) throw new Error("Provider not available for issuer sync");
+
+  const latestBlock = await provider.getBlockNumber();
+  let fromBlock = Math.max(issuerIndexLastIndexedBlock + 1, issuerIndexStartBlock);
+
+  if (fromBlock > latestBlock) {
+    issuerIndexLastUpdatedAtMs = Date.now();
+    return;
+  }
+
+  const issuerAuthEvent = contract.getEvent("IssuerAuthorizationUpdated");
+  const txFromCache = new Map<string, string | null>();
+  const blockTimestampCache = new Map<number, number>();
+
+  while (fromBlock <= latestBlock) {
+    const activeRange = Math.max(1, Math.min(providerMaxLogRange, certificateIndexBatchSize));
+    const toBlock = Math.min(fromBlock + activeRange - 1, latestBlock);
+    let issuerLogsRaw: unknown[] = [];
+    try {
+      issuerLogsRaw = await contract.queryFilter(issuerAuthEvent, fromBlock, toBlock);
+    } catch (err: any) {
+      if (isRateLimitError(err)) {
+        const backoffMs = Math.max(1000, certificateIndexRequestDelayMs * 8);
+        console.warn(`Provider rate limit hit during issuer sync. Backing off for ${backoffMs}ms`);
+        await sleep(backoffMs);
+        continue;
+      }
+
+      if (!isLogRangeLimitError(err)) {
+        throw err;
+      }
+
+      const parsedLimit = parseLogRangeLimit(err);
+      if (parsedLimit !== null) {
+        providerMaxLogRange = Math.max(1, parsedLimit);
+      } else {
+        providerMaxLogRange = Math.max(1, Math.floor(providerMaxLogRange / 2));
+      }
+
+      console.warn(
+        `Provider log range limit detected (issuer sync). Retrying with block window=${providerMaxLogRange}`
+      );
+      continue;
+    }
+
+    const logs = issuerLogsRaw
+      .filter(isEventLog)
+      .sort((a, b) => {
+        if (a.blockNumber !== b.blockNumber) return a.blockNumber - b.blockNumber;
+        return a.index - b.index;
+      });
+
+    const touchedIssuers = new Set<string>();
+    const issuerEvents: IssuerEventRow[] = [];
+
+    for (const log of logs) {
+      const issuerRaw = String(log.args?.[0] ?? "");
+      const issuer = normalizeAddress(issuerRaw)?.toLowerCase() || "";
+      if (!issuer) continue;
+      const allowed = Boolean(log.args?.[1]);
+      let changedAt = blockTimestampCache.get(log.blockNumber) ?? 0;
+      if (!blockTimestampCache.has(log.blockNumber)) {
+        try {
+          const block = await provider.getBlock(log.blockNumber);
+          changedAt = Number(block?.timestamp || 0);
+        } catch {
+          changedAt = 0;
+        }
+        blockTimestampCache.set(log.blockNumber, changedAt);
+      }
+
+      let changedBy = txFromCache.get(log.transactionHash) ?? null;
+      if (!txFromCache.has(log.transactionHash)) {
+        try {
+          const tx = await provider.getTransaction(log.transactionHash);
+          changedBy = normalizeAddress(String(tx?.from || ""))?.toLowerCase() || null;
+        } catch {
+          changedBy = null;
+        }
+        txFromCache.set(log.transactionHash, changedBy);
+      }
+
+      const existing = issuerStatusCache.get(issuer);
+      if (!existing || existing.lastBlockNumber <= log.blockNumber) {
+        issuerStatusCache.set(issuer, {
+          issuer,
+          isAuthorized: allowed,
+          lastTxHash: log.transactionHash,
+          lastBlockNumber: log.blockNumber,
+          lastChangedAt: changedAt,
+          changedBy,
+        });
+      }
+      touchedIssuers.add(issuer);
+
+      issuerEvents.push({
+        tx_hash: log.transactionHash,
+        log_index: log.index,
+        block_number: log.blockNumber,
+        issuer,
+        allowed,
+        changed_by: changedBy,
+        changed_at: changedAt || null,
+      });
+    }
+
+    const touchedEntries = Array.from(touchedIssuers)
+      .map((issuer) => issuerStatusCache.get(issuer))
+      .filter((entry): entry is IssuerStatusEntry => Boolean(entry));
+
+    await persistIssuerStatusesAndEvents(touchedEntries, issuerEvents);
+
+    issuerIndexLastIndexedBlock = toBlock;
+    issuerIndexLastUpdatedAtMs = Date.now();
+    await saveIssuerIndexerState();
+    fromBlock = toBlock + 1;
+  }
+}
+
 async function bootstrapCertificateIndexer(): Promise<void> {
   certificateIndexCache.clear();
   await hydrateCacheFromPersistentStore();
@@ -1167,9 +1497,10 @@ async function bootstrapCertificateIndexer(): Promise<void> {
   const state = await readCertificateIndexerState();
   const currentAddress = loadDeploymentAddress().toLowerCase();
 
+  const expectedStateName = useSupabaseIndexer ? certificateStateKey() : contractNetworkName;
   if (
     state &&
-    state.networkName === contractNetworkName &&
+    state.networkName === expectedStateName &&
     state.contractAddress.toLowerCase() === currentAddress
   ) {
     certificateIndexLastIndexedBlock = Math.max(
@@ -1183,6 +1514,30 @@ async function bootstrapCertificateIndexer(): Promise<void> {
   await syncCertificateIndexToLatest();
 }
 
+async function bootstrapIssuerIndexer(): Promise<void> {
+  issuerStatusCache.clear();
+  await hydrateIssuerCacheFromPersistentStore();
+
+  const state = await readIssuerIndexerState();
+  const currentAddress = loadDeploymentAddress().toLowerCase();
+
+  const expectedStateName = useSupabaseIndexer ? issuerStateKey() : contractNetworkName;
+  if (
+    state &&
+    state.networkName === expectedStateName &&
+    state.contractAddress.toLowerCase() === currentAddress
+  ) {
+    issuerIndexLastIndexedBlock = Math.max(
+      issuerIndexStartBlock - 1,
+      state.lastIndexedBlock
+    );
+  } else {
+    issuerIndexLastIndexedBlock = issuerIndexStartBlock - 1;
+  }
+
+  await syncIssuerIndexToLatest();
+}
+
 function startCertificateIndexerPolling(): void {
   setInterval(() => {
     if (certificateIndexSyncPromise) return;
@@ -1194,6 +1549,17 @@ function startCertificateIndexerPolling(): void {
         certificateIndexSyncPromise = null;
       });
   }, certificateIndexPollMs);
+
+  setInterval(() => {
+    if (issuerIndexSyncPromise) return;
+    issuerIndexSyncPromise = syncIssuerIndexToLatest()
+      .catch((err: any) => {
+        console.error("Issuer index poll failed:", err?.message || String(err));
+      })
+      .finally(() => {
+        issuerIndexSyncPromise = null;
+      });
+  }, issuerIndexPollMs);
 }
 
 function buildCertificateHistory(seedCertId: string): {
@@ -1730,6 +2096,7 @@ app.get("/api/certificates", async (req, res) => {
 app.get("/api/indexer/status", async (_req, res) => {
   try {
     await ensureCertificateIndexFresh();
+    await ensureIssuerIndexFresh();
     const contract = getReadOnlyContract();
     const latestBlock = await contract.runner!.provider!.getBlockNumber();
 
@@ -1739,14 +2106,56 @@ app.get("/api/indexer/status", async (_req, res) => {
       storage: useSupabaseIndexer ? "supabase" : "local-file",
       indexedCertificates: certificateIndexCache.size,
       lastIndexedBlock: certificateIndexLastIndexedBlock,
+      indexedIssuers: issuerStatusCache.size,
+      issuerLastIndexedBlock: issuerIndexLastIndexedBlock,
       latestBlock,
       lag: Math.max(0, latestBlock - certificateIndexLastIndexedBlock),
+      issuerLag: Math.max(0, latestBlock - issuerIndexLastIndexedBlock),
       refreshedAt: new Date(certificateIndexLastUpdatedAtMs).toISOString(),
+      issuerRefreshedAt: new Date(issuerIndexLastUpdatedAtMs).toISOString(),
       stateFile: certificateIndexStateFile,
     });
   } catch (err: any) {
     return res.status(500).json({
       error: "Indexer status failed",
+      message: err?.message || String(err),
+    });
+  }
+});
+
+app.get("/api/issuers", async (_req, res) => {
+  try {
+    await ensureIssuerIndexFresh();
+    const data = Array.from(issuerStatusCache.values()).sort((a, b) =>
+      a.issuer.localeCompare(b.issuer)
+    );
+    return res.json({
+      total: data.length,
+      refreshedAt: new Date(issuerIndexLastUpdatedAtMs).toISOString(),
+      data,
+    });
+  } catch (err: any) {
+    console.error("Issuer index failed:", err?.message || String(err));
+    return res.status(500).json({
+      error: "Issuer index failed",
+      message: err?.message || String(err),
+    });
+  }
+});
+
+app.post("/api/indexer/sync-issuers", async (_req, res) => {
+  try {
+    await rebuildIssuerIndexFromEvents();
+    return res.json({
+      ok: true,
+      indexedIssuers: issuerStatusCache.size,
+      lastIndexedBlock: issuerIndexLastIndexedBlock,
+      refreshedAt: new Date(issuerIndexLastUpdatedAtMs).toISOString(),
+    });
+  } catch (err: any) {
+    console.error("Issuer index rebuild failed:", err?.message || String(err));
+    return res.status(500).json({
+      error: "Issuer index rebuild failed",
       message: err?.message || String(err),
     });
   }
@@ -2162,6 +2571,9 @@ app.listen(port, () => {
   console.log(`Backend running on http://localhost:${port}`);
   ensureCertificateIndexFresh().catch((err: any) => {
     console.error("Certificate index bootstrap failed:", err?.message || String(err));
+  });
+  ensureIssuerIndexFresh().catch((err: any) => {
+    console.error("Issuer index bootstrap failed:", err?.message || String(err));
   });
   startCertificateIndexerPolling();
 });

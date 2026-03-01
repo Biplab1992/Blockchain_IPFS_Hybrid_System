@@ -75,6 +75,32 @@ async function apiJson(url, options = {}) {
   return parsed;
 }
 
+function normalizeUserFacingError(err) {
+  const candidates = [
+    err?.shortMessage,
+    err?.reason,
+    err?.message,
+    err?.info?.error?.message,
+    err?.error?.message,
+  ]
+    .map((v) => String(v || "").trim())
+    .filter(Boolean);
+
+  const combined = `${candidates.join(" ")} ${String(err || "")}`.toLowerCase();
+
+  if (
+    combined.includes("issuer not authorised") ||
+    combined.includes("issuer not authorized") ||
+    combined.includes("wallet is not an authorized issuer") ||
+    combined.includes("wallet is not an authorised issuer")
+  ) {
+    return "Issuer not authorized";
+  }
+
+  const raw = candidates[0] || String(err?.message || err || "").trim();
+  return raw || "Request failed";
+}
+
 async function ensureCorrectWalletNetwork() {
   if (!window.ethereum) {
     throw new Error("Wallet not found. Install MetaMask.");
@@ -361,7 +387,7 @@ function IssuePage({ ensureWallet }) {
         issuer: address,
       });
     } catch (submitError) {
-      setError(submitError.message || String(submitError));
+      setError(normalizeUserFacingError(submitError));
     } finally {
       setLoading(false);
     }
@@ -389,7 +415,7 @@ function IssuePage({ ensureWallet }) {
         issuer: address,
       });
     } catch (submitError) {
-      setRevokeError(submitError.message || String(submitError));
+      setRevokeError(normalizeUserFacingError(submitError));
     } finally {
       setRevokeLoading(false);
     }
@@ -416,7 +442,7 @@ function IssuePage({ ensureWallet }) {
         txHash: receipt?.hash || tx.hash,
       });
     } catch (submitError) {
-      setIssuerError(submitError.message || String(submitError));
+      setIssuerError(normalizeUserFacingError(submitError));
     } finally {
       setIssuerLoading(false);
     }
