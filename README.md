@@ -58,6 +58,14 @@ Minimum important variables:
 - `contracts/.env`: `DEPLOYER_PRIVATE_KEY` (for deploy scripts using raw signer)
 - `app/.env`: `VITE_API_BASE_URL`, `VITE_CONTRACT_ADDRESS`, `VITE_CHAIN_ID`, `VITE_RPC_URL`
 
+Additional auth variables (`backend/.env`):
+- `JWT_ACCESS_SECRET`
+- `JWT_REFRESH_SECRET`
+- `JWT_ACCESS_TTL_SEC`
+- `JWT_REFRESH_TTL_SEC`
+- `AUTH_RATE_WINDOW_MS`
+- `AUTH_RATE_MAX`
+
 If using Supabase indexer, also set:
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
@@ -173,6 +181,52 @@ Run the SQL in [`backend/supabase/schema.sql`](backend/supabase/schema.sql) to c
 - `issuer_events`
 
 Issuer authorization remains on-chain. Supabase tables are index/audit copies populated from `IssuerAuthorizationUpdated` events.
+
+## Auth + RBAC
+
+Roles:
+- `MOE_ADMIN`
+- `INSTITUTION_ADMIN`
+- `INDIVIDUAL`
+
+Core auth endpoints:
+- `POST /api/auth/register` (individual)
+- `POST /api/auth/login`
+- `POST /api/auth/refresh`
+- `POST /api/auth/logout`
+- `GET /api/auth/me`
+- `POST /api/auth/invitations/accept` (institution invite completion)
+
+MoE routes:
+- `POST /api/moe/institutions`
+- `PATCH /api/moe/institutions/:id/status`
+- `DELETE /api/moe/institutions/:id`
+- `GET /api/moe/institutions`
+- `POST /api/moe/institutions/:id/resend-invite`
+
+Invite email delivery (Resend):
+- Set backend env:
+  - `RESEND_API_KEY`
+  - `RESEND_FROM_EMAIL` (must be a verified sender/domain in Resend)
+  - optional `INVITE_EMAIL_SUBJECT_PREFIX`
+- When MoE creates/resends institution invites, backend now attempts to send email directly via Resend.
+- API response includes:
+  - `emailSent: true|false`
+  - `emailError` (when sending failed)
+  - `inviteUrl` fallback (for manual copy if needed)
+
+Institution routes:
+- `GET /api/institution/profile`
+- `POST /api/institution/wallet/nonce`
+- `POST /api/institution/wallet/verify-signature`
+- `POST /api/certificates/issue` (wallet-native preflight + audit)
+- `POST /api/certificates/revoke` (wallet-native preflight + audit)
+
+Security notes:
+- Passwords are hashed with bcrypt.
+- Refresh tokens are stored hashed.
+- Issuance/revoke gate checks institution status, wallet binding, wallet==issuer_wallet, and on-chain `authorizedIssuers`.
+- `GET /api/verify/:certId` remains public.
 
 ## End-to-End Demo Flow
 

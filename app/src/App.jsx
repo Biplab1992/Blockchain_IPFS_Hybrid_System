@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Link, Navigate, Route, Routes } from "react-router-dom";
+import { Link, NavLink, Navigate, Route, Routes, useNavigate, useSearchParams } from "react-router-dom";
 import { BrowserProvider, Contract } from "ethers";
 
 function isLoopbackHost(hostname) {
@@ -32,7 +32,8 @@ const CONTRACT_ADDRESS = import.meta.env.VITE_CONTRACT_ADDRESS || "0x5FbDB231567
 const RPC_URL = import.meta.env.VITE_RPC_URL || "http://127.0.0.1:8545";
 const REQUIRED_CHAIN_ID = Number(import.meta.env.VITE_CHAIN_ID || 31337);
 const REQUIRED_CHAIN_ID_HEX = `0x${REQUIRED_CHAIN_ID.toString(16)}`;
-const SITE_TITLE = "CertChain - Decentralized Academic Verification";
+const SITE_TITLE = "TrustMyCert - Decentralized Academic Verification";
+const AUTH_STORAGE_KEY = "certchain_auth_session_v1";
 
 const CONTRACT_ABI = [
   "function issueCertificate(string certId, string metadataCid, string fileCid, bytes32 fileHash, uint256 version, string replacesCertId)",
@@ -73,6 +74,26 @@ async function apiJson(url, options = {}) {
   }
 
   return parsed;
+}
+
+function loadSession() {
+  try {
+    const raw = localStorage.getItem(AUTH_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed?.accessToken || !parsed?.user) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function saveSession(session) {
+  localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(session));
+}
+
+function clearSession() {
+  localStorage.removeItem(AUTH_STORAGE_KEY);
 }
 
 function normalizeUserFacingError(err) {
@@ -193,12 +214,23 @@ function BlockchainLogo() {
 
 function App() {
   const [walletAddress, setWalletAddress] = useState("");
+  const [session, setSession] = useState(() => loadSession());
 
   useEffect(() => {
     document.title = SITE_TITLE;
   }, []);
 
   const isConnected = useMemo(() => Boolean(walletAddress), [walletAddress]);
+  const isLoggedIn = useMemo(() => Boolean(session?.accessToken), [session]);
+  const userRole = session?.user?.role || "";
+
+  async function authApi(path, options = {}) {
+    const headers = {
+      ...(options.headers || {}),
+      Authorization: `Bearer ${session?.accessToken || ""}`,
+    };
+    return apiJson(`${API_BASE}${path}`, { ...options, headers });
+  }
 
   async function connectWallet() {
     if (!window.ethereum) {
@@ -236,6 +268,22 @@ function App() {
     return { provider, signer, address };
   }
 
+  async function handleLogout() {
+    try {
+      if (session?.refreshToken) {
+        await apiJson(`${API_BASE}/api/auth/logout`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ refreshToken: session.refreshToken }),
+        });
+      }
+    } catch {
+      // Ignore logout network errors.
+    }
+    clearSession();
+    setSession(null);
+  }
+
   return (
     <div className="shell">
       <header className="topbar">
@@ -249,7 +297,7 @@ function App() {
             <BlockchainLogo />
           </button>
           <div className="brand-text">
-            <div className="brand-main">CertChain</div>
+            <div className="brand-main">TrustMyCert</div>
             <div className="brand-sub">Decentralized Academic Verification</div>
           </div>
         </div>
@@ -275,8 +323,16 @@ function App() {
             )}
           </div>
           <nav className="nav">
-            <Link to="/verify">Verify</Link>
-            <Link to="/issue">Issue</Link>
+            <NavLink to="/verify">Verify</NavLink>
+            {userRole === "INSTITUTION_ADMIN" ? <NavLink to="/institution">My Institution</NavLink> : null}
+            {userRole === "MOE_ADMIN" ? <NavLink to="/moe/institutions" end>Institutions</NavLink> : null}
+            {userRole === "MOE_ADMIN" ? <NavLink to="/moe" end>MoE</NavLink> : null}
+            {userRole === "INSTITUTION_ADMIN" ? <NavLink to="/issue">Issue</NavLink> : null}
+            {!isLoggedIn ? <NavLink to="/login">Login</NavLink> : null}
+            {!isLoggedIn ? <NavLink to="/register">Register</NavLink> : null}
+            {isLoggedIn ? (
+              <button type="button" onClick={handleLogout}>Logout</button>
+            ) : null}
           </nav>
         </div>
       </header>
@@ -285,17 +341,454 @@ function App() {
         <Routes>
           <Route path="/" element={<Navigate to="/verify" replace />} />
           <Route path="/verify" element={<VerifyPage />} />
-          <Route path="/issue" element={<IssuePage ensureWallet={ensureWallet} />} />
+          <Route path="/login" element={<LoginPage setSession={setSession} />} />
+          <Route path="/register" element={<RegisterPage setSession={setSession} />} />
+          <Route path="/invite" element={<InviteAcceptPage setSession={setSession} />} />
+          <Route path="/moe" element={
+            <RoleGuard session={session} allow={["MOE_ADMIN"]}>
+              <MoePage authApi={authApi} />
+            </RoleGuard>
+          } />
+          <Route path="/moe/institutions" element={
+            <RoleGuard session={session} allow={["MOE_ADMIN"]}>
+              <MoeInstitutionsPage authApi={authApi} />
+            </RoleGuard>
+          } />
+          <Route path="/institution" element={
+            <RoleGuard session={session} allow={["INSTITUTION_ADMIN"]}>
+              <InstitutionPage authApi={authApi} />
+            </RoleGuard>
+          } />
+          <Route path="/institution/wallet-bind" element={
+            <RoleGuard session={session} allow={["INSTITUTION_ADMIN"]}>
+              <InstitutionWalletBindPage authApi={authApi} ensureWallet={ensureWallet} />
+            </RoleGuard>
+          } />
+          <Route path="/issue" element={
+            <RoleGuard session={session} allow={["INSTITUTION_ADMIN"]}>
+              <IssuePage ensureWallet={ensureWallet} session={session} authApi={authApi} />
+            </RoleGuard>
+          } />
         </Routes>
       </main>
     </div>
   );
 }
 
-function IssuePage({ ensureWallet }) {
+function RoleGuard({ session, allow, children }) {
+  if (!session?.accessToken) return <Navigate to="/login" replace />;
+  const role = session?.user?.role || "";
+  if (!allow.includes(role)) return <Navigate to="/verify" replace />;
+  return children;
+}
+
+function LoginPage({ setSession }) {
+  const navigate = useNavigate();
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  async function onSubmit(e) {
+    e.preventDefault();
+    setLoading(true);
+    setError("");
+    try {
+      const resp = await apiJson(`${API_BASE}/api/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password }),
+      });
+      const session = {
+        accessToken: resp.accessToken,
+        refreshToken: resp.refreshToken,
+        user: resp.user,
+      };
+      saveSession(session);
+      setSession(session);
+      if (session?.user?.role === "MOE_ADMIN") {
+        navigate("/moe", { replace: true });
+      } else if (session?.user?.role === "INSTITUTION_ADMIN") {
+        navigate("/institution", { replace: true });
+      } else {
+        navigate("/verify", { replace: true });
+      }
+    } catch (err) {
+      setError(normalizeUserFacingError(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+  return (
+    <section className="card">
+      <h1>Login</h1>
+      <form className="form" onSubmit={onSubmit}>
+        <label>Email<input value={email} onChange={(e) => setEmail(e.target.value)} required /></label>
+        <label>Password<input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required /></label>
+        <button type="submit" disabled={loading}>{loading ? "Logging in..." : "Login"}</button>
+      </form>
+      {error ? <p className="error">{error}</p> : null}
+    </section>
+  );
+}
+
+function RegisterPage({ setSession }) {
+  const navigate = useNavigate();
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [role, setRole] = useState("INDIVIDUAL");
+  const [bootstrapSecret, setBootstrapSecret] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  async function onSubmit(e) {
+    e.preventDefault();
+    setLoading(true);
+    setError("");
+    try {
+      const resp = await apiJson(`${API_BASE}/api/auth/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email,
+          password,
+          role,
+          bootstrapSecret: role === "MOE_ADMIN" ? bootstrapSecret : undefined,
+        }),
+      });
+      const session = {
+        accessToken: resp.accessToken,
+        refreshToken: resp.refreshToken,
+        user: resp.user,
+      };
+      saveSession(session);
+      setSession(session);
+      if (session?.user?.role === "MOE_ADMIN") {
+        navigate("/moe", { replace: true });
+      } else {
+        navigate("/verify", { replace: true });
+      }
+    } catch (err) {
+      setError(normalizeUserFacingError(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+  return (
+    <section className="card">
+      <h1>Register</h1>
+      <form className="form" onSubmit={onSubmit}>
+        <label>Email<input value={email} onChange={(e) => setEmail(e.target.value)} required /></label>
+        <label>Password<input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required /></label>
+        <label>
+          Role
+          <select value={role} onChange={(e) => setRole(e.target.value)}>
+            <option value="INDIVIDUAL">INDIVIDUAL</option>
+            <option value="MOE_ADMIN">MOE_ADMIN</option>
+          </select>
+        </label>
+        {role === "MOE_ADMIN" ? (
+          <label>
+            MoE Bootstrap Secret
+            <input type="password" value={bootstrapSecret} onChange={(e) => setBootstrapSecret(e.target.value)} required />
+          </label>
+        ) : null}
+        <button type="submit" disabled={loading}>{loading ? "Creating..." : "Create Account"}</button>
+      </form>
+      {error ? <p className="error">{error}</p> : null}
+    </section>
+  );
+}
+
+function InviteAcceptPage({ setSession }) {
+  const navigate = useNavigate();
+  const [params] = useSearchParams();
+  const token = String(params.get("token") || "").trim();
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [success, setSuccess] = useState("");
+
+  async function onSubmit(e) {
+    e.preventDefault();
+    setError("");
+    setSuccess("");
+    if (!token) {
+      setError("Invite token is missing in URL.");
+      return;
+    }
+    if (password.length < 8) {
+      setError("Password must be at least 8 characters.");
+      return;
+    }
+    if (password !== confirmPassword) {
+      setError("Passwords do not match.");
+      return;
+    }
+    setLoading(true);
+    try {
+      const resp = await apiJson(`${API_BASE}/api/auth/invitations/accept`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token, password }),
+      });
+      const me = await apiJson(`${API_BASE}/api/auth/me`, {
+        headers: { Authorization: `Bearer ${resp.accessToken}` },
+      });
+      const session = {
+        accessToken: resp.accessToken,
+        refreshToken: resp.refreshToken,
+        user: me,
+      };
+      saveSession(session);
+      setSession(session);
+      setSuccess("Invitation accepted. Redirecting...");
+      navigate("/institution/wallet-bind", { replace: true });
+    } catch (err) {
+      setError(normalizeUserFacingError(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <section className="card">
+      <h1>Accept Institution Invite</h1>
+      {!token ? <p className="error">Invite link is invalid. Missing token.</p> : null}
+      <form className="form" onSubmit={onSubmit}>
+        <label>
+          New Password
+          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} required />
+        </label>
+        <label>
+          Confirm Password
+          <input type="password" value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} required />
+        </label>
+        <button type="submit" disabled={loading || !token}>
+          {loading ? "Accepting..." : "Accept Invite"}
+        </button>
+      </form>
+      {error ? <p className="error">{error}</p> : null}
+      {success ? <p>{success}</p> : null}
+    </section>
+  );
+}
+
+function MoePage({ authApi }) {
+  const [error, setError] = useState("");
+  const [info, setInfo] = useState("");
+  const [name, setName] = useState("");
+  const [adminEmail, setAdminEmail] = useState("");
+  const [issuerWallet, setIssuerWallet] = useState("");
+  async function createInst(e) {
+    e.preventDefault();
+    setError("");
+    setInfo("");
+    try {
+      const created = await authApi("/api/moe/institutions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, adminEmail, issuerWallet }),
+      });
+      setName(""); setAdminEmail(""); setIssuerWallet("");
+      if (created?.emailSent) {
+        setInfo(`Invite email sent to ${adminEmail}.`);
+      } else {
+        const fallback = String(created?.inviteUrl || "").trim();
+        const err = String(created?.emailError || "").trim();
+        setInfo(`Invite created${fallback ? ` (manual link: ${fallback})` : ""}${err ? `; email error: ${err}` : ""}`);
+      }
+    } catch (err) {
+      setError(normalizeUserFacingError(err));
+    }
+  }
+
+  return (
+    <section className="card">
+      <h1>MoE Dashboard</h1>
+      <form className="form" onSubmit={createInst}>
+        <label>Institution Name<input value={name} onChange={(e) => setName(e.target.value)} required /></label>
+        <label>Admin Email<input value={adminEmail} onChange={(e) => setAdminEmail(e.target.value)} required /></label>
+        <label>Issuer Wallet<input value={issuerWallet} onChange={(e) => setIssuerWallet(e.target.value)} required /></label>
+        <button type="submit">Create + Invite</button>
+      </form>
+      {error ? <p className="error">{error}</p> : null}
+      {info ? <p>{info}</p> : null}
+    </section>
+  );
+}
+
+function MoeInstitutionsPage({ authApi }) {
+  const [rows, setRows] = useState([]);
+  const [error, setError] = useState("");
+  const [info, setInfo] = useState("");
+  async function load() {
+    try {
+      const r = await authApi("/api/moe/institutions");
+      setRows(Array.isArray(r.data) ? r.data : []);
+    } catch (err) {
+      setError(normalizeUserFacingError(err));
+    }
+  }
+  useEffect(() => { void load(); }, []);
+
+  async function updateStatus(id, status) {
+    setError("");
+    setInfo("");
+    try {
+      await authApi(`/api/moe/institutions/${encodeURIComponent(id)}/status`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status }),
+      });
+      setInfo(`Institution status updated to ${status}.`);
+      await load();
+    } catch (err) {
+      setError(normalizeUserFacingError(err));
+    }
+  }
+
+  async function deleteInstitution(id, name) {
+    const ok = window.confirm(`Delete institution "${name}" permanently? This cannot be undone.`);
+    if (!ok) return;
+    setError("");
+    setInfo("");
+    try {
+      await authApi(`/api/moe/institutions/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+      });
+      setInfo("Institution deleted.");
+      await load();
+    } catch (err) {
+      setError(normalizeUserFacingError(err));
+    }
+  }
+
+  return (
+    <section className="card">
+      <h1>Institutions</h1>
+      {error ? <p className="error">{error}</p> : null}
+      {info ? <p>{info}</p> : null}
+      <div className="result">
+        {rows.length === 0 ? <p>No institutions yet.</p> : null}
+        {rows.map((row) => (
+          <div key={row.id} className="result" style={{ marginBottom: 12 }}>
+            <p><strong>Name:</strong> {row.name}</p>
+            <p><strong>Status:</strong> {row.status}</p>
+            <p><strong>Admin:</strong> {row.admin_email}</p>
+            <p><strong>Issuer Wallet:</strong> {row.issuer_wallet}</p>
+            <p><strong>ID:</strong> {row.id}</p>
+            <div className="action-row">
+              <button type="button" onClick={() => updateStatus(row.id, "ACTIVE")} disabled={row.status === "ACTIVE"}>
+                Activate
+              </button>
+              <button type="button" className="revoke-button" onClick={() => updateStatus(row.id, "SUSPENDED")} disabled={row.status === "SUSPENDED"}>
+                Suspend
+              </button>
+              <button type="button" className="revoke-button" onClick={() => deleteInstitution(row.id, row.name)}>
+                Delete
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function InstitutionPage({ authApi }) {
+  const [profile, setProfile] = useState(null);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    void authApi("/api/institution/profile")
+      .then(setProfile)
+      .catch((err) => setError(normalizeUserFacingError(err)));
+  }, []);
+  const isBound = Boolean(profile?.binding?.verified);
+  const boundAddress = String(profile?.binding?.walletAddress || "").trim();
+  return (
+    <section className="card">
+      <h1>Institution Dashboard</h1>
+      <p><strong>Wallet status:</strong> {isBound ? "Bound" : "Not bound"}</p>
+      {isBound ? <p><strong>Bound address:</strong> {boundAddress || "-"}</p> : null}
+      {!isBound ? (
+        <p><Link to="/institution/wallet-bind">Bind Wallet</Link></p>
+      ) : (
+        <p><Link to="/institution/wallet-bind">Rebind Wallet</Link></p>
+      )}
+      {error ? <p className="error">{error}</p> : null}
+      <pre>{JSON.stringify(profile || {}, null, 2)}</pre>
+    </section>
+  );
+}
+
+function InstitutionWalletBindPage({ authApi, ensureWallet }) {
+  const [error, setError] = useState("");
+  const [result, setResult] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [boundWallet, setBoundWallet] = useState("");
+  const [alreadyBound, setAlreadyBound] = useState(false);
+
+  useEffect(() => {
+    void authApi("/api/institution/profile")
+      .then((p) => {
+        const verified = Boolean(p?.binding?.verified);
+        const wallet = String(p?.binding?.walletAddress || "").trim();
+        setAlreadyBound(verified);
+        setBoundWallet(wallet);
+      })
+      .catch(() => {
+        // If profile fetch fails, keep bind action available.
+      });
+  }, []);
+
+  async function run() {
+    if (alreadyBound) return;
+    setLoading(true);
+    setError("");
+    try {
+      const { signer, address } = await ensureWallet();
+      const nonceResp = await authApi("/api/institution/wallet/nonce", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ walletAddress: address }),
+      });
+      const signature = await signer.signMessage(nonceResp.message);
+      const verifyResp = await authApi("/api/institution/wallet/verify-signature", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          walletAddress: address,
+          nonce: nonceResp.nonce,
+          signature,
+        }),
+      });
+      setResult(verifyResp);
+      setAlreadyBound(Boolean(verifyResp?.verified));
+      setBoundWallet(String(verifyResp?.wallet || "").trim());
+    } catch (err) {
+      setError(normalizeUserFacingError(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+  return (
+    <section className="card">
+      <h1>Bind Institution Wallet</h1>
+      <button type="button" disabled={loading || alreadyBound} onClick={run}>
+        {alreadyBound ? "Wallet Already Bound" : (loading ? "Binding..." : "Connect + Sign")}
+      </button>
+      {alreadyBound ? <p>Bound wallet: {boundWallet || "verified"}</p> : null}
+      {error ? <p className="error">{error}</p> : null}
+      {result ? <pre>{JSON.stringify(result, null, 2)}</pre> : null}
+    </section>
+  );
+}
+
+function IssuePage({ ensureWallet, session, authApi }) {
   const [certId, setCertId] = useState("");
   const [title, setTitle] = useState("");
   const [recipient, setRecipient] = useState("");
+  const [institutionName, setInstitutionName] = useState("");
   const [version, setVersion] = useState(1);
   const [replacesCertId, setReplacesCertId] = useState("");
   const [file, setFile] = useState(null);
@@ -312,10 +805,22 @@ function IssuePage({ ensureWallet }) {
   const [issuerResult, setIssuerResult] = useState(null);
   const [issuerError, setIssuerError] = useState("");
 
+  useEffect(() => {
+    if (!session?.accessToken || session?.user?.role !== "INSTITUTION_ADMIN") return;
+    void authApi("/api/institution/profile")
+      .then((p) => setInstitutionName(String(p?.institution?.name || "").trim()))
+      .catch(() => setInstitutionName(""));
+  }, [session?.accessToken, session?.user?.role]);
+
   async function onSubmit(event) {
     event.preventDefault();
     setError("");
     setResult(null);
+
+    if (!session?.accessToken || session?.user?.role !== "INSTITUTION_ADMIN") {
+      setError("Institution login required for issuance.");
+      return;
+    }
 
     if (!file) {
       setError("Select a PDF first.");
@@ -331,11 +836,16 @@ function IssuePage({ ensureWallet }) {
       form.append("certId", certId);
       form.append("title", title);
       form.append("recipient", recipient);
+      form.append("institutionName", institutionName);
       form.append("version", String(version));
       form.append("replacesCertId", replacesCertId);
 
       const pinResp = await apiJson(`${API_BASE}/api/pin`, {
         method: "POST",
+        headers: {
+          Authorization: `Bearer ${session.accessToken}`,
+          "x-wallet-address": address,
+        },
         body: form,
       });
 
@@ -356,6 +866,21 @@ function IssuePage({ ensureWallet }) {
         replacesCertId.trim()
       );
       const receipt = await tx.wait();
+      try {
+        await authApi("/api/certificates/issue", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            certId: certId.trim(),
+            metadataCid,
+            fileCid,
+            txHash: receipt?.hash || tx.hash,
+            connectedWallet: address,
+          }),
+        });
+      } catch {
+        // Do not fail issuance UI if audit endpoint fails.
+      }
       let indexed = false;
       try {
         await apiJson(`${API_BASE}/api/indexer/upsert-cert`, {
@@ -377,6 +902,7 @@ function IssuePage({ ensureWallet }) {
 
       setResult({
         certId: certId.trim(),
+        title: String(pinResp?.metadata?.title || title || "").trim(),
         metadataCid,
         fileCid,
         fileHash,
@@ -385,6 +911,7 @@ function IssuePage({ ensureWallet }) {
         qrCodeImageUrl: buildQrCodeImageUrl(String(pinResp.verificationUrl || "").trim() || buildVerifyUrl(certId)),
         txHash: receipt?.hash || tx.hash,
         issuer: address,
+        institutionName: String(pinResp?.metadata?.institutionName || institutionName || "").trim(),
       });
     } catch (submitError) {
       setError(normalizeUserFacingError(submitError));
@@ -409,6 +936,21 @@ function IssuePage({ ensureWallet }) {
       const contract = new Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
       const tx = await contract.revokeCertificate(revokeCertId.trim());
       const receipt = await tx.wait();
+      if (session?.accessToken && session?.user?.role === "INSTITUTION_ADMIN") {
+        try {
+          await authApi("/api/certificates/revoke", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              certId: revokeCertId.trim(),
+              txHash: receipt?.hash || tx.hash,
+              connectedWallet: address,
+            }),
+          });
+        } catch {
+          // audit endpoint failures are non-blocking
+        }
+      }
       setRevokeResult({
         certId: revokeCertId.trim(),
         txHash: receipt?.hash || tx.hash,
@@ -457,6 +999,9 @@ function IssuePage({ ensureWallet }) {
           <div className="info-tooltip">Wallet-native issue flow. Backend is used for IPFS pinning only.</div>
         </div>
       </div>
+      {!session?.accessToken || session?.user?.role !== "INSTITUTION_ADMIN" ? (
+        <p className="error">Login as INSTITUTION_ADMIN and bind wallet before issuing certificates.</p>
+      ) : null}
 
       <form className="form" onSubmit={onSubmit}>
         <label>
@@ -470,6 +1015,10 @@ function IssuePage({ ensureWallet }) {
         <label>
           Recipient
           <input value={recipient} onChange={(e) => setRecipient(e.target.value)} />
+        </label>
+        <label>
+          Institution Name
+          <input value={institutionName} readOnly />
         </label>
         <label>
           Version
@@ -499,6 +1048,8 @@ function IssuePage({ ensureWallet }) {
         <div className="result">
           <h2>Issued</h2>
           <p><strong>certId:</strong> {result.certId}</p>
+          <p><strong>title:</strong> {result.title || "-"}</p>
+          <p><strong>institutionName:</strong> {result.institutionName || "-"}</p>
           <p><strong>metadataCid:</strong> {result.metadataCid}</p>
           <p><strong>fileCid:</strong> {result.fileCid}</p>
           <p><strong>fileHash:</strong> {result.fileHash}</p>
@@ -682,6 +1233,8 @@ function VerifyPage() {
         <div className="result">
           <h2 className={statusClass}>{result.status}</h2>
           <p><strong>Issuer:</strong> {result.issuer}</p>
+          <p><strong>Title:</strong> {String(result?.metadata?.title || "").trim() || "-"}</p>
+          <p><strong>Institution:</strong> {String(result?.metadata?.institutionName || "").trim() || "-"}</p>
           <p><strong>Metadata CID:</strong> {result.metadataCid}</p>
           <p><strong>File CID:</strong> {result.fileCid}</p>
           <p><strong>Integrity Match:</strong> {String(result.integrityMatch)}</p>

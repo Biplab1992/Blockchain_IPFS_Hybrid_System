@@ -15,8 +15,11 @@ import path from "path";
 import { fileURLToPath } from "url";
 import jwt from "jsonwebtoken";
 import { Contract, JsonRpcProvider, Wallet, getAddress, verifyMessage, type EventLog } from "ethers";
+import { institutionPinGuard, registerSecurityRoutes } from "./security.js";
 
-dotenv.config();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+dotenv.config({ path: path.resolve(__dirname, "..", ".env") });
 
 // Safe JWT fingerprint (helps confirm backend loaded the right .env)
 const loadedJwt = process.env.PINATA_JWT || "";
@@ -70,8 +73,8 @@ app.use(cors({
     if (corsOrigins.includes(origin) || isLocalDevOrigin(origin)) return callback(null, true);
     return callback(new Error("Origin not allowed by CORS"));
   },
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+  methods: ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "x-wallet-address"],
 }));
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "1mb" }));
 app.use(express.urlencoded({ extended: false, limit: process.env.FORM_BODY_LIMIT || "1mb" }));
@@ -86,6 +89,13 @@ const pinRateLimiter = rateLimit({
 const verifyRateLimiter = rateLimit({
   windowMs: Number(process.env.RATE_LIMIT_VERIFY_WINDOW_MS || 60_000),
   max: Number(process.env.RATE_LIMIT_VERIFY_MAX || 60),
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const authRateLimiter = rateLimit({
+  windowMs: Number(process.env.AUTH_RATE_WINDOW_MS || 60_000),
+  max: Number(process.env.AUTH_RATE_MAX || 40),
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -106,6 +116,8 @@ const upload = multer({
   },
 });
 
+registerSecurityRoutes(app, authRateLimiter);
+
 function sha256Hex(buffer: Buffer) {
   return crypto.createHash("sha256").update(buffer).digest("hex");
 }
@@ -118,6 +130,7 @@ type EmbeddedPdfMetadata = {
   certId: string;
   title: string;
   recipient: string;
+  institutionName: string;
   version: number;
   replacesCertId: string;
   verificationUrl: string;
@@ -135,6 +148,7 @@ async function embedVerificationMetadataInPdf(input: Buffer, metadata: EmbeddedP
   const keywords = [
     `certId:${metadata.certId || ""}`,
     `recipient:${metadata.recipient || ""}`,
+    `institution:${metadata.institutionName || ""}`,
     `version:${metadata.version}`,
     `replaces:${metadata.replacesCertId || ""}`,
     `verify:${metadata.verificationUrl}`,
@@ -153,8 +167,6 @@ async function embedVerificationMetadataInPdf(input: Buffer, metadata: EmbeddedP
   return Buffer.from(await pdf.save());
 }
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 const workspaceRoot = path.resolve(__dirname, "..", "..");
 
 const CERTIFICATE_REGISTRY_ABI = [
@@ -251,12 +263,14 @@ let certificateIndexLastUpdatedAtMs = 0;
 let certificateIndexLastIndexedBlock = certificateIndexStartBlock - 1;
 let certificateIndexBootstrapPromise: Promise<void> | null = null;
 let certificateIndexSyncPromise: Promise<void> | null = null;
+let certificateIndexLastError = "";
 let providerMaxLogRange = certificateIndexBatchSize;
 const issuerStatusCache = new Map<string, IssuerStatusEntry>();
 let issuerIndexLastUpdatedAtMs = 0;
 let issuerIndexLastIndexedBlock = issuerIndexStartBlock - 1;
 let issuerIndexBootstrapPromise: Promise<void> | null = null;
 let issuerIndexSyncPromise: Promise<void> | null = null;
+let issuerIndexLastError = "";
 
 type CertificateRow = {
   cert_id: string;
@@ -819,6 +833,32 @@ async function ensureIssuerIndexFresh(): Promise<void> {
   await issuerIndexSyncPromise;
 }
 
+function triggerCertificateIndexerRefreshIfNeeded(): void {
+  const isFresh = Date.now() - certificateIndexLastUpdatedAtMs <= certificateIndexRefreshMs;
+  if (isFresh || certificateIndexSyncPromise) return;
+  certificateIndexSyncPromise = syncCertificateIndexToLatest()
+    .catch((err: any) => {
+      certificateIndexLastError = err?.message || String(err);
+      console.error("Certificate index background refresh failed:", certificateIndexLastError);
+    })
+    .finally(() => {
+      certificateIndexSyncPromise = null;
+    });
+}
+
+function triggerIssuerIndexerRefreshIfNeeded(): void {
+  const isFresh = Date.now() - issuerIndexLastUpdatedAtMs <= issuerIndexRefreshMs;
+  if (isFresh || issuerIndexSyncPromise) return;
+  issuerIndexSyncPromise = syncIssuerIndexToLatest()
+    .catch((err: any) => {
+      issuerIndexLastError = err?.message || String(err);
+      console.error("Issuer index background refresh failed:", issuerIndexLastError);
+    })
+    .finally(() => {
+      issuerIndexSyncPromise = null;
+    });
+}
+
 type CertificateIndexerState = {
   networkName: string;
   contractAddress: string;
@@ -1224,7 +1264,20 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
+  let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+  const timeoutPromise = new Promise<never>((_resolve, reject) => {
+    timeoutHandle = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    if (timeoutHandle) clearTimeout(timeoutHandle);
+  }
+}
+
 async function syncCertificateIndexToLatest(): Promise<void> {
+  certificateIndexLastError = "";
   const contract = getReadOnlyContract();
   const latestBlock = await contract.runner!.provider!.getBlockNumber();
   let fromBlock = Math.max(certificateIndexLastIndexedBlock + 1, certificateIndexStartBlock);
@@ -1369,6 +1422,7 @@ async function syncCertificateIndexToLatest(): Promise<void> {
 }
 
 async function syncIssuerIndexToLatest(): Promise<void> {
+  issuerIndexLastError = "";
   const contract = getReadOnlyContract();
   const provider = contract.runner?.provider;
   if (!provider) throw new Error("Provider not available for issuer sync");
@@ -1761,7 +1815,7 @@ app.post("/api/auth/verify", async (req, res) => {
 });
 
 
-app.post("/api/pin", pinRateLimiter, upload.single("file"), async (req, res) => {
+app.post("/api/pin", ...institutionPinGuard(authRateLimiter), pinRateLimiter, upload.single("file"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
 
@@ -1771,6 +1825,7 @@ app.post("/api/pin", pinRateLimiter, upload.single("file"), async (req, res) => 
     const certId = String(req.body?.certId || "").trim();
     const title = String(req.body?.title || "").trim();
     const recipient = String(req.body?.recipient || "").trim();
+    const institutionName = String(req.body?.institutionName || "").trim();
     const replacesCertId = String(req.body?.replacesCertId || "").trim();
     const versionRaw = Number(req.body?.version);
     const version = Number.isFinite(versionRaw) && versionRaw > 0 ? Math.floor(versionRaw) : 1;
@@ -1807,6 +1862,7 @@ app.post("/api/pin", pinRateLimiter, upload.single("file"), async (req, res) => 
           certId,
           title,
           recipient,
+          institutionName,
           version,
           replacesCertId,
           verificationUrl,
@@ -1834,6 +1890,7 @@ app.post("/api/pin", pinRateLimiter, upload.single("file"), async (req, res) => 
       fileHash: `0x${fileHash}`,
       title,
       recipient,
+      institutionName,
       version,
       replacesCertId,
       sourceFileName: req.file.originalname,
@@ -1846,6 +1903,7 @@ app.post("/api/pin", pinRateLimiter, upload.single("file"), async (req, res) => 
         certId,
         title,
         recipient,
+        institutionName,
         version,
         replacesCertId,
         verificationUrl,
@@ -1933,7 +1991,7 @@ app.get("/api/verify/:certId", verifyRateLimiter, async (req, res) => {
 
     let certId = requestedCertId;
     let chainTuple:
-      | [string, string, string, string, bigint, string, bigint, boolean]
+      | [string, string, string, string, bigint, string, bigint, boolean, boolean]
       | null = null;
     let lastErr: unknown = null;
     for (const candidate of certIdCandidates) {
@@ -1947,17 +2005,32 @@ app.get("/api/verify/:certId", verifyRateLimiter, async (req, res) => {
           string,
           bigint,
           boolean,
+          boolean,
         ];
+        const exists = Boolean(chainTuple[8]);
+        if (!exists) {
+          chainTuple = null;
+          continue;
+        }
         certId = candidate;
         break;
       } catch (err) {
         lastErr = err;
       }
     }
-    if (!chainTuple) throw lastErr;
+    if (!chainTuple) {
+      if (lastErr) throw lastErr;
+      return res.status(404).json({ error: "Certificate not found", certId: requestedCertId });
+    }
 
     const [metadataCid, fileCidOnChain, onChainHash, issuer, version, replacesCertId, issuedAt, revoked] = chainTuple;
     metadataCidForError = metadataCid;
+    if (!String(metadataCid || "").trim()) {
+      return res.status(422).json({
+        error: "Certificate metadata CID is missing on-chain",
+        certId,
+      });
+    }
 
     const metadata = await fetchCidJson<PinnedMetadata>(metadataCid);
     const metadataFileCid = String(metadata?.fileCid || "").trim();
@@ -2095,10 +2168,20 @@ app.get("/api/certificates", async (req, res) => {
 
 app.get("/api/indexer/status", async (_req, res) => {
   try {
-    await ensureCertificateIndexFresh();
-    await ensureIssuerIndexFresh();
-    const contract = getReadOnlyContract();
-    const latestBlock = await contract.runner!.provider!.getBlockNumber();
+    triggerCertificateIndexerRefreshIfNeeded();
+    triggerIssuerIndexerRefreshIfNeeded();
+
+    let latestBlock: number | null = null;
+    try {
+      const contract = getReadOnlyContract();
+      latestBlock = await withTimeout(
+        contract.runner!.provider!.getBlockNumber(),
+        5000,
+        "latestBlock timeout"
+      );
+    } catch {
+      latestBlock = null;
+    }
 
     return res.json({
       network: contractNetworkName,
@@ -2109,10 +2192,14 @@ app.get("/api/indexer/status", async (_req, res) => {
       indexedIssuers: issuerStatusCache.size,
       issuerLastIndexedBlock: issuerIndexLastIndexedBlock,
       latestBlock,
-      lag: Math.max(0, latestBlock - certificateIndexLastIndexedBlock),
-      issuerLag: Math.max(0, latestBlock - issuerIndexLastIndexedBlock),
+      lag: latestBlock === null ? null : Math.max(0, latestBlock - certificateIndexLastIndexedBlock),
+      issuerLag: latestBlock === null ? null : Math.max(0, latestBlock - issuerIndexLastIndexedBlock),
       refreshedAt: new Date(certificateIndexLastUpdatedAtMs).toISOString(),
       issuerRefreshedAt: new Date(issuerIndexLastUpdatedAtMs).toISOString(),
+      certificateSyncRunning: Boolean(certificateIndexSyncPromise || certificateIndexBootstrapPromise),
+      issuerSyncRunning: Boolean(issuerIndexSyncPromise || issuerIndexBootstrapPromise),
+      certificateLastError: certificateIndexLastError || null,
+      issuerLastError: issuerIndexLastError || null,
       stateFile: certificateIndexStateFile,
     });
   } catch (err: any) {
@@ -2125,13 +2212,15 @@ app.get("/api/indexer/status", async (_req, res) => {
 
 app.get("/api/issuers", async (_req, res) => {
   try {
-    await ensureIssuerIndexFresh();
+    triggerIssuerIndexerRefreshIfNeeded();
     const data = Array.from(issuerStatusCache.values()).sort((a, b) =>
       a.issuer.localeCompare(b.issuer)
     );
     return res.json({
       total: data.length,
       refreshedAt: new Date(issuerIndexLastUpdatedAtMs).toISOString(),
+      syncRunning: Boolean(issuerIndexSyncPromise || issuerIndexBootstrapPromise),
+      lastError: issuerIndexLastError || null,
       data,
     });
   } catch (err: any) {
@@ -2145,12 +2234,25 @@ app.get("/api/issuers", async (_req, res) => {
 
 app.post("/api/indexer/sync-issuers", async (_req, res) => {
   try {
-    await rebuildIssuerIndexFromEvents();
-    return res.json({
+    const started = !issuerIndexSyncPromise;
+    if (started) {
+      issuerIndexSyncPromise = rebuildIssuerIndexFromEvents()
+        .catch((err: any) => {
+          issuerIndexLastError = err?.message || String(err);
+          console.error("Issuer index rebuild failed:", issuerIndexLastError);
+        })
+        .finally(() => {
+          issuerIndexSyncPromise = null;
+        });
+    }
+    return res.status(202).json({
       ok: true,
+      started,
+      syncRunning: true,
       indexedIssuers: issuerStatusCache.size,
       lastIndexedBlock: issuerIndexLastIndexedBlock,
       refreshedAt: new Date(issuerIndexLastUpdatedAtMs).toISOString(),
+      lastError: issuerIndexLastError || null,
     });
   } catch (err: any) {
     console.error("Issuer index rebuild failed:", err?.message || String(err));
@@ -2593,6 +2695,9 @@ app.use((err: unknown, _req: express.Request, res: express.Response, _next: expr
     if (err.message === "Origin not allowed by CORS") {
       return res.status(403).json({ error: err.message });
     }
+    console.error("Unhandled server error:", err.message);
+    if (err.stack) console.error(err.stack);
+    return res.status(500).json({ error: "Unhandled server error", message: err.message });
   }
 
   return res.status(500).json({ error: "Unhandled server error" });

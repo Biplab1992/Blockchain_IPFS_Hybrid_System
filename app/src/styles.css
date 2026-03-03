@@ -121,6 +121,14 @@ a {
   background: #ffffff;
   border: 1px solid #d5e3ea;
   font-weight: 700;
+  color: #0a6c86;
+}
+
+.nav a.active {
+  background: #0f8da9;
+  color: #ffffff;
+  border-color: #0f8da9;
+  box-shadow: 0 6px 16px rgba(12, 88, 112, 0.24);
 }
 
 .auth-pill {
