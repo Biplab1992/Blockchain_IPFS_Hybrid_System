@@ -213,6 +213,7 @@ function BlockchainLogo() {
 }
 
 function App() {
+  const navigate = useNavigate();
   const [walletAddress, setWalletAddress] = useState("");
   const [session, setSession] = useState(() => loadSession());
 
@@ -280,66 +281,81 @@ function App() {
     } catch {
       // Ignore logout network errors.
     }
+    setWalletAddress("");
     clearSession();
     setSession(null);
+    navigate("/", { replace: true });
   }
 
   return (
     <div className="shell">
-      <header className="topbar">
-        <div className="brand-lockup">
-          <button
-            type="button"
-            className="logo-button"
-            onClick={() => window.location.reload()}
-            title="Refresh page"
-          >
-            <BlockchainLogo />
-          </button>
-          <div className="brand-text">
-            <div className="brand-main">TrustMyCert</div>
-            <div className="brand-sub">Decentralized Academic Verification</div>
+      {isLoggedIn ? (
+        <header className="topbar">
+          <div className="brand-lockup">
+            <button
+              type="button"
+              className="logo-button"
+              onClick={() => window.location.assign("/")}
+              title="Go to homepage"
+            >
+              <BlockchainLogo />
+            </button>
+            <div className="brand-text">
+              <div className="brand-main">TrustMyCert</div>
+              <div className="brand-sub">Decentralized Academic Verification</div>
+            </div>
           </div>
-        </div>
-        <div className="header-right">
-          <div className="auth-pill">
-            {isConnected ? (
-              <>
-                <span>{walletAddress.slice(0, 6)}...{walletAddress.slice(-4)}</span>
-                <button onClick={() => setWalletAddress("")}>Disconnect</button>
-              </>
-            ) : (
-              <button
-                onClick={async () => {
-                  try {
-                    await connectWallet();
-                  } catch (error) {
-                    alert(error.message || String(error));
-                  }
-                }}
-              >
-                Connect Wallet
-              </button>
-            )}
+          <div className="header-right">
+            <div className="auth-pill">
+              {isConnected ? (
+                <>
+                  <span>{walletAddress.slice(0, 6)}...{walletAddress.slice(-4)}</span>
+                  <button onClick={() => setWalletAddress("")}>Disconnect</button>
+                </>
+              ) : (
+                <button
+                  onClick={async () => {
+                    try {
+                      await connectWallet();
+                    } catch (error) {
+                      alert(error.message || String(error));
+                    }
+                  }}
+                >
+                  Connect Wallet
+                </button>
+              )}
+            </div>
+            <nav className="nav">
+              <NavLink to="/verify">Verify</NavLink>
+              {userRole === "INSTITUTION_ADMIN" ? <NavLink to="/institution">My Institution</NavLink> : null}
+              {userRole === "MOE_ADMIN" ? <NavLink to="/moe/institutions" end>Institutions</NavLink> : null}
+              {userRole === "MOE_ADMIN" ? <NavLink to="/moe" end>MoE</NavLink> : null}
+              {userRole === "INSTITUTION_ADMIN" ? <NavLink to="/issue">Issue</NavLink> : null}
+              {isLoggedIn ? (
+                <button type="button" onClick={handleLogout}>Logout</button>
+              ) : null}
+            </nav>
           </div>
-          <nav className="nav">
-            <NavLink to="/verify">Verify</NavLink>
-            {userRole === "INSTITUTION_ADMIN" ? <NavLink to="/institution">My Institution</NavLink> : null}
-            {userRole === "MOE_ADMIN" ? <NavLink to="/moe/institutions" end>Institutions</NavLink> : null}
-            {userRole === "MOE_ADMIN" ? <NavLink to="/moe" end>MoE</NavLink> : null}
-            {userRole === "INSTITUTION_ADMIN" ? <NavLink to="/issue">Issue</NavLink> : null}
-            {!isLoggedIn ? <NavLink to="/login">Login</NavLink> : null}
-            {!isLoggedIn ? <NavLink to="/register">Register</NavLink> : null}
-            {isLoggedIn ? (
-              <button type="button" onClick={handleLogout}>Logout</button>
-            ) : null}
-          </nav>
-        </div>
-      </header>
+        </header>
+      ) : (
+        <header className="topbar topbar-public">
+          <div className="brand-lockup">
+            <button
+              type="button"
+              className="logo-button"
+              onClick={() => window.location.assign("/")}
+              title="Go to homepage"
+            >
+              <BlockchainLogo />
+            </button>
+          </div>
+        </header>
+      )}
 
       <main className="page">
         <Routes>
-          <Route path="/" element={<Navigate to="/verify" replace />} />
+          <Route path="/" element={isLoggedIn ? <Navigate to="/verify" replace /> : <HomePage />} />
           <Route path="/verify" element={<VerifyPage />} />
           <Route path="/login" element={<LoginPage setSession={setSession} />} />
           <Route path="/register" element={<RegisterPage setSession={setSession} />} />
@@ -372,6 +388,21 @@ function App() {
         </Routes>
       </main>
     </div>
+  );
+}
+
+function HomePage() {
+  return (
+    <section className="card home-hero">
+      <h1>TrustMyCert</h1>
+      <p className="home-copy">
+        Decentralized Academic Verification Platform
+      </p>
+      <div className="action-row">
+        <Link className="home-secondary" to="/login">Sign In</Link>
+        <Link className="home-primary" to="/register">Get Started</Link>
+      </div>
+    </section>
   );
 }
 
@@ -419,7 +450,7 @@ function LoginPage({ setSession }) {
     }
   }
   return (
-    <section className="card">
+    <section className="auth-page">
       <h1>Login</h1>
       <form className="form" onSubmit={onSubmit}>
         <label>Email<input value={email} onChange={(e) => setEmail(e.target.value)} required /></label>
@@ -473,7 +504,7 @@ function RegisterPage({ setSession }) {
     }
   }
   return (
-    <section className="card">
+    <section className="auth-page">
       <h1>Register</h1>
       <form className="form" onSubmit={onSubmit}>
         <label>Email<input value={email} onChange={(e) => setEmail(e.target.value)} required /></label>
@@ -551,7 +582,7 @@ function InviteAcceptPage({ setSession }) {
   }
 
   return (
-    <section className="card">
+    <section className="auth-page">
       <h1>Accept Institution Invite</h1>
       {!token ? <p className="error">Invite link is invalid. Missing token.</p> : null}
       <form className="form" onSubmit={onSubmit}>
@@ -708,6 +739,7 @@ function InstitutionPage({ authApi }) {
   return (
     <section className="card">
       <h1>Institution Dashboard</h1>
+      <p><strong>Institution Name:</strong> {String(profile?.institution?.name || "").trim() || "-"}</p>
       <p><strong>Wallet status:</strong> {isBound ? "Bound" : "Not bound"}</p>
       {isBound ? <p><strong>Bound address:</strong> {boundAddress || "-"}</p> : null}
       {!isBound ? (

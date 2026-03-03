@@ -3,11 +3,23 @@
 :root {
   color-scheme: light;
   font-family: "Sora", "Segoe UI", sans-serif;
+  --bg-0: #f3f9ff;
+  --bg-1: #e9f4ff;
+  --bg-2: #d8ebff;
+  --card: rgba(255, 255, 255, 0.82);
+  --line: #c8daea;
+  --text: #0f2431;
+  --muted: #476376;
+  --primary-0: #0e95be;
+  --primary-1: #0a7ea4;
+  --primary-2: #085f84;
+  --danger-0: #a92945;
+  --danger-1: #8b2139;
   background:
-    radial-gradient(circle at 8% 8%, #ffe3c6 0%, transparent 42%),
-    radial-gradient(circle at 92% 88%, #cfeeff 0%, transparent 38%),
-    linear-gradient(180deg, #f9fcff 0%, #f2f7fa 100%);
-  color: #11202a;
+    radial-gradient(circle at 4% 8%, #dff3ff 0%, transparent 34%),
+    radial-gradient(circle at 88% 88%, #d7ebff 0%, transparent 38%),
+    linear-gradient(180deg, var(--bg-0) 0%, var(--bg-1) 60%, var(--bg-2) 100%);
+  color: var(--text);
 }
 
 * {
@@ -18,16 +30,47 @@ body {
   margin: 0;
   min-height: 100vh;
   font-weight: 600;
+  color: var(--text);
+  position: relative;
+  overflow-x: hidden;
+}
+
+body::before,
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: -1;
+}
+
+body::before {
+  background:
+    radial-gradient(circle at 14% 22%, rgba(17, 149, 196, 0.24) 0%, transparent 28%),
+    radial-gradient(circle at 84% 20%, rgba(8, 103, 145, 0.22) 0%, transparent 32%),
+    radial-gradient(circle at 76% 78%, rgba(38, 142, 190, 0.20) 0%, transparent 30%),
+    radial-gradient(circle at 22% 78%, rgba(12, 84, 129, 0.18) 0%, transparent 26%);
+}
+
+body::after {
+  background:
+    radial-gradient(circle at 14% 22%, rgba(12, 87, 132, 0.32) 0 2px, transparent 3px),
+    radial-gradient(circle at 84% 20%, rgba(12, 87, 132, 0.26) 0 2px, transparent 3px),
+    radial-gradient(circle at 76% 78%, rgba(12, 87, 132, 0.22) 0 2px, transparent 3px),
+    repeating-linear-gradient(90deg, rgba(16, 86, 130, 0.08) 0 1px, transparent 1px 86px),
+    repeating-linear-gradient(0deg, rgba(16, 86, 130, 0.08) 0 1px, transparent 1px 86px);
+  mask-image: radial-gradient(circle at center, black 12%, rgba(0, 0, 0, 0.88) 52%, transparent 96%);
 }
 
 a {
-  color: #0a6c86;
+  color: var(--primary-2);
 }
 
 .shell {
   max-width: 1080px;
   margin: 0 auto;
-  padding: 24px;
+  padding: 26px;
+  position: relative;
 }
 
 .topbar {
@@ -36,12 +79,13 @@ a {
   align-items: center;
   justify-content: space-between;
   gap: 18px;
-  margin-bottom: 26px;
-  background: #f9fbfd;
-  border: 2px solid #d7e4ec;
+  margin-bottom: 28px;
+  background: linear-gradient(145deg, rgba(255,255,255,0.86), rgba(245,251,255,0.82));
+  border: 1px solid var(--line);
   border-radius: 24px;
-  padding: 18px 20px;
-  backdrop-filter: blur(8px);
+  padding: 18px 22px;
+  backdrop-filter: blur(12px);
+  box-shadow: 0 20px 38px rgba(10, 67, 100, 0.08);
 }
 
 .brand-lockup {
@@ -51,7 +95,7 @@ a {
 }
 
 .logo-button {
-  border: 0;
+  border: 1px solid #d6e5f2;
   background: #ffffff;
   padding: 0;
   cursor: pointer;
@@ -62,7 +106,13 @@ a {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  box-shadow: inset 0 0 0 1px #d9e6ee;
+  box-shadow: 0 10px 20px rgba(10, 67, 100, 0.12);
+  transition: transform 140ms ease, box-shadow 140ms ease;
+}
+
+.logo-button:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 13px 24px rgba(10, 67, 100, 0.16);
 }
 
 .logo-button:focus-visible {
@@ -84,23 +134,23 @@ a {
 }
 
 .brand-main {
-  font-size: 2.50rem;
-  font-weight: 700;
+  font-size: 2.45rem;
+  font-weight: 800;
   letter-spacing: 0.01em;
   line-height: 0.95;
-  color: #0e2330;
+  color: #102636;
 }
 
 .brand-sub {
-  font-size: .85rem;
+  font-size: 0.92rem;
   font-weight: 700;
   letter-spacing: 0.01em;
-  color: #152d3a;
+  color: #274354;
 }
 
 .nav {
   display: flex;
-  gap: 14px;
+  gap: 12px;
 }
 
 .header-right {
@@ -108,27 +158,63 @@ a {
   flex-direction: column;
   align-items: flex-end;
   gap: 10px;
-  background: #f9fbfd;
-  border: 0px solid #dbe7ee;
+  background: transparent;
+  border: 0;
   border-radius: 16px;
-  padding: 12px 14px;
+  padding: 10px 0;
 }
 
 .nav a {
   text-decoration: none;
-  padding: 8px 14px;
-  border-radius: 10px;
+  padding: 9px 15px;
+  border-radius: 12px;
   background: #ffffff;
-  border: 1px solid #d5e3ea;
+  border: 1px solid #d2e2ef;
   font-weight: 700;
-  color: #0a6c86;
+  color: var(--primary-2);
+  transition: all 130ms ease;
+}
+
+.nav a:hover {
+  border-color: #9cc5de;
+  transform: translateY(-1px);
 }
 
 .nav a.active {
-  background: #0f8da9;
+  background: linear-gradient(135deg, var(--primary-0), var(--primary-1));
   color: #ffffff;
-  border-color: #0f8da9;
-  box-shadow: 0 6px 16px rgba(12, 88, 112, 0.24);
+  border-color: var(--primary-1);
+  box-shadow: 0 8px 18px rgba(10, 111, 149, 0.28);
+}
+
+.topbar-public {
+  display: flex;
+  justify-content: flex-start;
+  align-items: center;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  padding-inline: 0;
+  margin-bottom: 6px;
+}
+
+.brand-center {
+  text-align: center;
+  font-size: 2rem;
+  font-weight: 800;
+  color: #102636;
+  letter-spacing: 0.01em;
+}
+
+.nav-public a {
+  min-width: 110px;
+  text-align: center;
+}
+
+.nav-public .cta-link {
+  background: linear-gradient(135deg, var(--primary-0), var(--primary-1));
+  color: #fff;
+  border-color: var(--primary-1);
 }
 
 .auth-pill {
@@ -139,13 +225,19 @@ a {
 
 .auth-pill button {
   border: 0;
-  border-radius: 10px;
-  padding: 10px 14px;
+  border-radius: 12px;
+  padding: 11px 16px;
   cursor: pointer;
   font-family: inherit;
   font-weight: 700;
-  background: #1a2631;
+  background: #122535;
   color: #fff;
+  transition: transform 140ms ease, box-shadow 140ms ease;
+}
+
+.auth-pill button:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 10px 20px rgba(11, 40, 60, 0.28);
 }
 
 .auth-pill span {
@@ -159,19 +251,87 @@ a {
 }
 
 .card {
-  background: #ffffffd6;
-  backdrop-filter: blur(6px);
-  border: 1px solid #d3e0e8;
-  border-radius: 18px;
-  padding: 24px;
-  box-shadow: 0 14px 34px rgba(16, 41, 61, 0.08);
+  background: var(--card);
+  backdrop-filter: blur(10px);
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  padding: 26px;
+  box-shadow: 0 22px 42px rgba(12, 48, 78, 0.10);
 }
 
 .card h1 {
-  margin: 4px 0 10px;
-  font-size: 2.85rem;
+  margin: 2px 0 10px;
+  font-size: 2.78rem;
   font-weight: 800;
   letter-spacing: 0.01em;
+}
+
+.home-hero {
+  text-align: center;
+  padding: 24px 30px 40px;
+  background: transparent;
+  border: 0;
+  box-shadow: none;
+  backdrop-filter: none;
+  min-height: calc(100vh - 180px);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+.home-copy {
+  max-width: 760px;
+  margin: 0 auto 22px;
+  color: var(--muted);
+  font-size: 1.7rem;
+  line-height: 1.35;
+  font-weight: 600;
+}
+
+.home-hero h1 {
+  font-size: 4.1rem;
+  margin-bottom: 14px;
+  text-shadow: 0 10px 30px rgba(8, 94, 133, 0.20);
+}
+
+.home-hero .action-row {
+  justify-content: center;
+}
+
+.auth-page {
+  max-width: 840px;
+  margin: 24px auto 0;
+  padding: 10px 4px;
+}
+
+.auth-page h1 {
+  margin: 4px 0 14px;
+  font-size: 3rem;
+  letter-spacing: 0.01em;
+}
+
+.home-primary,
+.home-secondary {
+  text-decoration: none;
+  border-radius: 12px;
+  padding: 12px 16px;
+  font-weight: 800;
+  min-width: 190px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.home-primary {
+  background: linear-gradient(135deg, var(--primary-0), var(--primary-1));
+  color: #fff;
+}
+
+.home-secondary {
+  background: #fff;
+  border: 1px solid #cfe0eb;
+  color: #124157;
 }
 
 .title-row {
@@ -190,8 +350,8 @@ a {
   width: 28px;
   height: 28px;
   border-radius: 50%;
-  border: 1px solid #c4d4de;
-  background: #f6fafc;
+  border: 1px solid #b8cfdd;
+  background: #f4fbff;
   color: #0e2330;
   font-size: 0.95rem;
   font-weight: 800;
@@ -232,13 +392,13 @@ a {
 
 .card h2 {
   margin: 6px 0 10px;
-  font-size: 1.5rem;
+  font-size: 1.52rem;
   font-weight: 800;
 }
 
 .sub {
   margin-top: 4px;
-  color: #51636e;
+  color: var(--muted);
   font-weight: 600;
 }
 
@@ -257,25 +417,39 @@ a {
 
 .form input {
   width: 100%;
-  border: 1px solid #bdd0db;
-  border-radius: 11px;
-  padding: 12px 13px;
+  border: 1px solid #bcd1e0;
+  border-radius: 12px;
+  padding: 12px 14px;
   font-size: 1.02rem;
   font-family: inherit;
   font-weight: 600;
-  background: #fff;
+  background: #fbfdff;
+  color: var(--text);
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.form input:focus {
+  outline: none;
+  border-color: #7eb6d6;
+  box-shadow: 0 0 0 4px rgba(24, 128, 176, 0.12);
 }
 
 .form button {
   border: 0;
-  border-radius: 11px;
+  border-radius: 12px;
   padding: 12px 15px;
   cursor: pointer;
   font-family: inherit;
   font-weight: 800;
   letter-spacing: 0.01em;
-  background: linear-gradient(135deg, #0b8da8 0%, #0b6f95 100%);
+  background: linear-gradient(135deg, var(--primary-0) 0%, var(--primary-1) 100%);
   color: #fff;
+  transition: transform 130ms ease, box-shadow 130ms ease;
+}
+
+.form button:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 10px 20px rgba(9, 109, 147, 0.25);
 }
 
 .form button:disabled {
@@ -292,11 +466,11 @@ a {
 .section-divider {
   margin: 20px 0;
   border: 0;
-  border-top: 1px solid #d3e0e8;
+  border-top: 1px solid #d4e2eb;
 }
 
 .revoke-button {
-  background: linear-gradient(135deg, #a22641 0%, #851f35 100%) !important;
+  background: linear-gradient(135deg, var(--danger-0) 0%, var(--danger-1) 100%) !important;
 }
 
 .error {
@@ -307,18 +481,18 @@ a {
 
 .result {
   margin-top: 16px;
-  border: 1px solid #cfdee6;
-  border-radius: 12px;
-  padding: 15px;
-  background: #fff;
+  border: 1px solid #cfdeea;
+  border-radius: 14px;
+  padding: 16px;
+  background: rgba(255, 255, 255, 0.86);
 }
 
 .result pre {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  background: #f5f8fa;
+  background: #f4f8fc;
   border: 1px solid #d6e2e8;
-  border-radius: 8px;
+  border-radius: 10px;
   padding: 10px;
 }
 
@@ -333,9 +507,9 @@ a {
   max-width: 100%;
   height: auto;
   border: 1px solid #d6e2e8;
-  border-radius: 10px;
+  border-radius: 12px;
   background: #fff;
-  padding: 8px;
+  padding: 10px;
 }
 
 .chain-panel {
@@ -408,11 +582,11 @@ a {
 
 @media (max-width: 880px) {
   .brand-main {
-    font-size: 2rem;
+    font-size: 1.9rem;
   }
 
   .brand-sub {
-    font-size: 1.05rem;
+    font-size: 0.9rem;
   }
 
   .card h1 {
@@ -445,5 +619,26 @@ a {
 
   .auth-pill span {
     font-size: 1rem;
+  }
+
+  .topbar-public {
+    justify-content: center;
+    gap: 12px;
+  }
+
+  .brand-center {
+    font-size: 1.7rem;
+  }
+
+  .home-hero {
+    min-height: calc(100vh - 140px);
+  }
+
+  .home-hero h1 {
+    font-size: 2.7rem;
+  }
+
+  .home-copy {
+    font-size: 1.2rem;
   }
 }
