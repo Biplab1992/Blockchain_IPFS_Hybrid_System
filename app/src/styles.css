@@ -74,11 +74,13 @@ a {
 }
 
 .topbar {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-areas:
+    "brand controls"
+    "tabs tabs";
   align-items: center;
-  justify-content: space-between;
-  gap: 18px;
+  gap: 16px;
   margin-bottom: 28px;
   background: linear-gradient(145deg, rgba(255,255,255,0.86), rgba(245,251,255,0.82));
   border: 1px solid var(--line);
@@ -86,6 +88,19 @@ a {
   padding: 18px 22px;
   backdrop-filter: blur(12px);
   box-shadow: 0 20px 38px rgba(10, 67, 100, 0.08);
+}
+
+.brand-lockup {
+  grid-area: brand;
+}
+
+.header-right {
+  grid-area: controls;
+}
+
+.nav-center {
+  grid-area: tabs;
+  width: 100%;
 }
 
 .brand-lockup {
@@ -151,17 +166,27 @@ a {
 .nav {
   display: flex;
   gap: 12px;
+  flex-wrap: nowrap;
+  justify-content: center;
+  white-space: nowrap;
+  overflow-x: auto;
+  padding-bottom: 2px;
 }
 
 .header-right {
   display: flex;
-  flex-direction: column;
-  align-items: flex-end;
-  gap: 10px;
+  align-items: center;
+  justify-self: end;
+  gap: 8px;
   background: transparent;
   border: 0;
   border-radius: 16px;
-  padding: 10px 0;
+  padding: 0;
+}
+
+.nav-center {
+  display: flex;
+  justify-content: center;
 }
 
 .nav a {
@@ -173,6 +198,7 @@ a {
   font-weight: 700;
   color: var(--primary-2);
   transition: all 130ms ease;
+  white-space: nowrap;
 }
 
 .nav a:hover {
@@ -219,8 +245,9 @@ a {
 
 .auth-pill {
   display: flex;
-  gap: 10px;
+  gap: 8px;
   align-items: center;
+  justify-content: flex-end;
 }
 
 .auth-pill button {
@@ -614,7 +641,21 @@ a {
 
   .header-right {
     width: 100%;
-    align-items: flex-start;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .topbar {
+    grid-template-columns: 1fr;
+    grid-template-areas:
+      "brand"
+      "controls"
+      "tabs";
+    justify-items: center;
+  }
+
+  .nav-center {
+    width: 100%;
   }
 
   .auth-pill span {

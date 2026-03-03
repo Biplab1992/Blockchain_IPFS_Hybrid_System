@@ -185,6 +185,8 @@ type CertificateIndexEntry = {
   certId: string;
   cid: string;
   metadataCid: string;
+  title?: string;
+  institutionName?: string;
   fileCid: string;
   fileHash: string;
   issuer: string;
@@ -275,6 +277,8 @@ let issuerIndexLastError = "";
 type CertificateRow = {
   cert_id: string;
   issuer: string | null;
+  title?: string | null;
+  institution_name?: string | null;
   metadata_cid: string | null;
   file_cid: string | null;
   file_hash: string | null;
@@ -610,9 +614,13 @@ function isEventLog(log: unknown): log is EventLog {
 }
 
 function toCertificateRow(entry: CertificateIndexEntry): CertificateRow {
+  const title = String(entry.title || "").trim();
+  const institutionName = String(entry.institutionName || "").trim();
   return {
     cert_id: entry.certId,
     issuer: entry.issuer || null,
+    ...(title ? { title } : {}),
+    ...(institutionName ? { institution_name: institutionName } : {}),
     metadata_cid: entry.metadataCid || entry.cid || null,
     file_cid: entry.fileCid || "",
     file_hash: entry.fileHash || "",
@@ -633,6 +641,8 @@ function fromCertificateRow(row: CertificateRow): CertificateIndexEntry {
     certId: row.cert_id,
     cid: metadataCid,
     metadataCid,
+    title: row.title || "",
+    institutionName: row.institution_name || "",
     fileCid: row.file_cid || "",
     fileHash: row.file_hash || "",
     issuer: (row.issuer || "").toLowerCase(),
@@ -758,6 +768,8 @@ async function loadCertificateEntryFromChain(
     certId,
     cid: String(cert[0] || ""),
     metadataCid: String(cert[0] || ""),
+    title: "",
+    institutionName: "",
     fileCid: String(cert[1] || ""),
     fileHash: String(cert[2] || "").toLowerCase(),
     issuer: String(cert[3] || "").toLowerCase(),
@@ -2274,6 +2286,8 @@ app.post("/api/indexer/upsert-cert", async (req, res) => {
       return res.status(400).json({ error: "certId is required" });
     }
     const issueTxHash = String(req.body?.issueTxHash || "").trim();
+    const title = String(req.body?.title || "").trim();
+    const institutionName = String(req.body?.institutionName || "").trim();
     const issueBlockNumberRaw = Number(req.body?.issueBlockNumber);
     const issueBlockNumber =
       Number.isFinite(issueBlockNumberRaw) && issueBlockNumberRaw > 0
@@ -2285,6 +2299,8 @@ app.post("/api/indexer/upsert-cert", async (req, res) => {
       issueTxHash,
       issueBlockNumber,
     });
+    entry.title = title;
+    entry.institutionName = institutionName;
     if (!entry.issueTxHash) {
       return res.status(422).json({
         error: "issueTxHash is required to persist this schema",

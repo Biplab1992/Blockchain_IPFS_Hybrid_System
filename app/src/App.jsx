@@ -305,6 +305,17 @@ function App() {
               <div className="brand-sub">Decentralized Academic Verification</div>
             </div>
           </div>
+          <div className="nav-center">
+            <nav className="nav">
+              {userRole === "INSTITUTION_ADMIN" ? <NavLink to="/institution">My Institution</NavLink> : null}
+              {userRole === "INSTITUTION_ADMIN" ? <NavLink to="/issue">Issue</NavLink> : null}
+              {userRole === "INSTITUTION_ADMIN" ? <NavLink to="/revoke">Revoke</NavLink> : null}
+              <NavLink to="/verify">Verify</NavLink>
+              {userRole === "INSTITUTION_ADMIN" ? <NavLink to="/issuer-admin">Issuer Admin</NavLink> : null}
+              {userRole === "MOE_ADMIN" ? <NavLink to="/moe/institutions" end>Institutions</NavLink> : null}
+              {userRole === "MOE_ADMIN" ? <NavLink to="/moe" end>MoE</NavLink> : null}
+            </nav>
+          </div>
           <div className="header-right">
             <div className="auth-pill">
               {isConnected ? (
@@ -325,17 +336,8 @@ function App() {
                   Connect Wallet
                 </button>
               )}
+              <button type="button" onClick={handleLogout}>Logout</button>
             </div>
-            <nav className="nav">
-              <NavLink to="/verify">Verify</NavLink>
-              {userRole === "INSTITUTION_ADMIN" ? <NavLink to="/institution">My Institution</NavLink> : null}
-              {userRole === "MOE_ADMIN" ? <NavLink to="/moe/institutions" end>Institutions</NavLink> : null}
-              {userRole === "MOE_ADMIN" ? <NavLink to="/moe" end>MoE</NavLink> : null}
-              {userRole === "INSTITUTION_ADMIN" ? <NavLink to="/issue">Issue</NavLink> : null}
-              {isLoggedIn ? (
-                <button type="button" onClick={handleLogout}>Logout</button>
-              ) : null}
-            </nav>
           </div>
         </header>
       ) : (
@@ -383,6 +385,16 @@ function App() {
           <Route path="/issue" element={
             <RoleGuard session={session} allow={["INSTITUTION_ADMIN"]}>
               <IssuePage ensureWallet={ensureWallet} session={session} authApi={authApi} />
+            </RoleGuard>
+          } />
+          <Route path="/revoke" element={
+            <RoleGuard session={session} allow={["INSTITUTION_ADMIN"]}>
+              <RevokePage ensureWallet={ensureWallet} session={session} authApi={authApi} />
+            </RoleGuard>
+          } />
+          <Route path="/issuer-admin" element={
+            <RoleGuard session={session} allow={["INSTITUTION_ADMIN"]}>
+              <IssuerAdminPage ensureWallet={ensureWallet} />
             </RoleGuard>
           } />
         </Routes>
@@ -828,15 +840,6 @@ function IssuePage({ ensureWallet, session, authApi }) {
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
 
-  const [revokeCertId, setRevokeCertId] = useState("");
-  const [revokeLoading, setRevokeLoading] = useState(false);
-  const [revokeResult, setRevokeResult] = useState(null);
-  const [revokeError, setRevokeError] = useState("");
-  const [issuerAddress, setIssuerAddress] = useState("");
-  const [issuerLoading, setIssuerLoading] = useState(false);
-  const [issuerResult, setIssuerResult] = useState(null);
-  const [issuerError, setIssuerError] = useState("");
-
   useEffect(() => {
     if (!session?.accessToken || session?.user?.role !== "INSTITUTION_ADMIN") return;
     void authApi("/api/institution/profile")
@@ -924,6 +927,8 @@ function IssuePage({ ensureWallet, session, authApi }) {
             certId: certId.trim(),
             issueTxHash: receipt?.hash || tx.hash,
             issueBlockNumber: receipt?.blockNumber || null,
+            title: title.trim(),
+            institutionName: institutionName.trim(),
           }),
           timeoutMs: 30000,
         });
@@ -949,76 +954,6 @@ function IssuePage({ ensureWallet, session, authApi }) {
       setError(normalizeUserFacingError(submitError));
     } finally {
       setLoading(false);
-    }
-  }
-
-  async function onRevoke(event) {
-    event.preventDefault();
-    setRevokeError("");
-    setRevokeResult(null);
-
-    if (!revokeCertId.trim()) {
-      setRevokeError("Enter certificate ID to revoke.");
-      return;
-    }
-
-    setRevokeLoading(true);
-    try {
-      const { signer, address } = await ensureWallet();
-      const contract = new Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
-      const tx = await contract.revokeCertificate(revokeCertId.trim());
-      const receipt = await tx.wait();
-      if (session?.accessToken && session?.user?.role === "INSTITUTION_ADMIN") {
-        try {
-          await authApi("/api/certificates/revoke", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              certId: revokeCertId.trim(),
-              txHash: receipt?.hash || tx.hash,
-              connectedWallet: address,
-            }),
-          });
-        } catch {
-          // audit endpoint failures are non-blocking
-        }
-      }
-      setRevokeResult({
-        certId: revokeCertId.trim(),
-        txHash: receipt?.hash || tx.hash,
-        issuer: address,
-      });
-    } catch (submitError) {
-      setRevokeError(normalizeUserFacingError(submitError));
-    } finally {
-      setRevokeLoading(false);
-    }
-  }
-
-  async function onSetIssuer(allowed) {
-    setIssuerError("");
-    setIssuerResult(null);
-
-    if (!issuerAddress.trim()) {
-      setIssuerError("Enter issuer wallet address.");
-      return;
-    }
-
-    setIssuerLoading(true);
-    try {
-      const { signer } = await ensureWallet();
-      const contract = new Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
-      const tx = await contract.setIssuer(issuerAddress.trim(), allowed);
-      const receipt = await tx.wait();
-      setIssuerResult({
-        issuer: issuerAddress.trim(),
-        allowed,
-        txHash: receipt?.hash || tx.hash,
-      });
-    } catch (submitError) {
-      setIssuerError(normalizeUserFacingError(submitError));
-    } finally {
-      setIssuerLoading(false);
     }
   }
 
@@ -1103,15 +1038,61 @@ function IssuePage({ ensureWallet, session, authApi }) {
           </div>
         </div>
       ) : null}
+    </section>
+  );
+}
 
-      <hr className="section-divider" />
+function RevokePage({ ensureWallet, session, authApi }) {
+  const [revokeCertId, setRevokeCertId] = useState("");
+  const [revokeLoading, setRevokeLoading] = useState(false);
+  const [revokeResult, setRevokeResult] = useState(null);
+  const [revokeError, setRevokeError] = useState("");
 
+  async function onRevoke(event) {
+    event.preventDefault();
+    setRevokeError("");
+    setRevokeResult(null);
+    if (!revokeCertId.trim()) {
+      setRevokeError("Enter certificate ID to revoke.");
+      return;
+    }
+    setRevokeLoading(true);
+    try {
+      const { signer, address } = await ensureWallet();
+      const contract = new Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
+      const tx = await contract.revokeCertificate(revokeCertId.trim());
+      const receipt = await tx.wait();
+      if (session?.accessToken && session?.user?.role === "INSTITUTION_ADMIN") {
+        try {
+          await authApi("/api/certificates/revoke", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              certId: revokeCertId.trim(),
+              txHash: receipt?.hash || tx.hash,
+              connectedWallet: address,
+            }),
+          });
+        } catch {
+          // audit endpoint failures are non-blocking
+        }
+      }
+      setRevokeResult({
+        certId: revokeCertId.trim(),
+        txHash: receipt?.hash || tx.hash,
+        issuer: address,
+      });
+    } catch (submitError) {
+      setRevokeError(normalizeUserFacingError(submitError));
+    } finally {
+      setRevokeLoading(false);
+    }
+  }
+
+  return (
+    <section className="card">
       <div className="title-row">
-        <h2>Revoke Certificate</h2>
-        <div className="info-wrap">
-          <span className="info-button" aria-label="About revoke flow" tabIndex={0}>i</span>
-          <div className="info-tooltip">Wallet-native revoke by certificate ID.</div>
-        </div>
+        <h1>Revoke Certificate</h1>
       </div>
       <form className="form" onSubmit={onRevoke}>
         <label>
@@ -1122,7 +1103,6 @@ function IssuePage({ ensureWallet, session, authApi }) {
           {revokeLoading ? "Revoking..." : "Revoke"}
         </button>
       </form>
-
       {revokeError ? <p className="error">{revokeError}</p> : null}
       {revokeResult ? (
         <div className="result">
@@ -1131,15 +1111,45 @@ function IssuePage({ ensureWallet, session, authApi }) {
           <p><strong>txHash:</strong> {revokeResult.txHash}</p>
         </div>
       ) : null}
+    </section>
+  );
+}
 
-      <hr className="section-divider" />
+function IssuerAdminPage({ ensureWallet }) {
+  const [issuerAddress, setIssuerAddress] = useState("");
+  const [issuerLoading, setIssuerLoading] = useState(false);
+  const [issuerResult, setIssuerResult] = useState(null);
+  const [issuerError, setIssuerError] = useState("");
 
+  async function onSetIssuer(allowed) {
+    setIssuerError("");
+    setIssuerResult(null);
+    if (!issuerAddress.trim()) {
+      setIssuerError("Enter issuer wallet address.");
+      return;
+    }
+    setIssuerLoading(true);
+    try {
+      const { signer } = await ensureWallet();
+      const contract = new Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
+      const tx = await contract.setIssuer(issuerAddress.trim(), allowed);
+      const receipt = await tx.wait();
+      setIssuerResult({
+        issuer: issuerAddress.trim(),
+        allowed,
+        txHash: receipt?.hash || tx.hash,
+      });
+    } catch (submitError) {
+      setIssuerError(normalizeUserFacingError(submitError));
+    } finally {
+      setIssuerLoading(false);
+    }
+  }
+
+  return (
+    <section className="card">
       <div className="title-row">
-        <h2>Issuer Admin Panel</h2>
-        <div className="info-wrap">
-          <span className="info-button" aria-label="About issuer admin panel" tabIndex={0}>i</span>
-          <div className="info-tooltip">Owner-only action on contract: add/remove authorized issuers.</div>
-        </div>
+        <h1>Issuer Admin Panel</h1>
       </div>
       <div className="form">
         <label>
@@ -1160,7 +1170,6 @@ function IssuePage({ ensureWallet, session, authApi }) {
           </button>
         </div>
       </div>
-
       {issuerError ? <p className="error">{issuerError}</p> : null}
       {issuerResult ? (
         <div className="result">

@@ -3,6 +3,8 @@ create extension if not exists pgcrypto;
 create table if not exists public.certificates (
   cert_id text primary key,
   issuer text,
+  title text,
+  institution_name text,
   metadata_cid text,
   file_cid text,
   file_hash text,
@@ -17,6 +19,9 @@ create table if not exists public.certificates (
   revoked_at bigint null,
   updated_at timestamptz not null default now()
 );
+
+alter table public.certificates add column if not exists title text;
+alter table public.certificates add column if not exists institution_name text;
 
 create index if not exists certificates_issuer_idx on public.certificates (issuer);
 create index if not exists certificates_block_number_idx on public.certificates (block_number desc);
