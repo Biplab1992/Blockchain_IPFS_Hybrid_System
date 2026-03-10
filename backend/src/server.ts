@@ -6,7 +6,7 @@ import dotenv from "dotenv";
 import axios from "axios";
 import crypto from "crypto";
 import FormData from "form-data";
-import { PDFDocument } from "pdf-lib";
+import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import fs from "fs";
@@ -21,18 +21,50 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.resolve(__dirname, "..", ".env") });
 
+type LogLevel = "info" | "warn" | "error";
+
+function logEvent(level: LogLevel, message: string, fields?: Record<string, unknown>): void {
+  const payload = {
+    ts: new Date().toISOString(),
+    level,
+    message,
+    ...(fields || {}),
+  };
+  const line = JSON.stringify(payload);
+  if (level === "error") {
+    console.error(line);
+    return;
+  }
+  if (level === "warn") {
+    console.warn(line);
+    return;
+  }
+  console.log(line);
+}
+
+function getRequestId(req: express.Request): string {
+  const existing = String((req as any).requestId || "").trim();
+  return existing || "unknown";
+}
+
 // Safe JWT fingerprint (helps confirm backend loaded the right .env)
 const loadedJwt = process.env.PINATA_JWT || "";
-console.log(
-  "PINATA_JWT loaded:",
-  loadedJwt ? `${loadedJwt.slice(0, 12)}...${loadedJwt.slice(-6)}` : "(missing)"
-);
+logEvent("info", "PINATA_JWT loaded", {
+  fingerprint: loadedJwt ? `${loadedJwt.slice(0, 12)}...${loadedJwt.slice(-6)}` : "(missing)",
+});
 
 const app = express();
+const nodeEnv = (process.env.NODE_ENV || "development").toLowerCase();
+const isProduction = nodeEnv === "production";
 const corsOrigins = (process.env.CORS_ORIGINS || "http://localhost:3000,http://localhost:5173")
   .split(",")
   .map((o) => o.trim())
   .filter(Boolean);
+const cspConnectSrc = ["'self'", ...corsOrigins];
+
+if (isProduction && corsOrigins.length === 0) {
+  throw new Error("CORS_ORIGINS must be set in production");
+}
 
 function isLocalDevOrigin(origin: string): boolean {
   try {
@@ -66,15 +98,63 @@ function getPreferredLanIpv4(): string | null {
 }
 
 app.disable("x-powered-by");
-app.use(helmet());
+app.use((req, res, next) => {
+  const inboundRequestId = String(req.header("x-request-id") || "").trim();
+  const requestId = inboundRequestId || crypto.randomUUID();
+  const startedAtMs = Date.now();
+  (req as any).requestId = requestId;
+  res.setHeader("x-request-id", requestId);
+
+  logEvent("info", "http_request_start", {
+    requestId,
+    method: req.method,
+    path: req.originalUrl || req.url,
+    ip: req.ip,
+  });
+
+  res.on("finish", () => {
+    logEvent("info", "http_request_finish", {
+      requestId,
+      method: req.method,
+      path: req.originalUrl || req.url,
+      statusCode: res.statusCode,
+      durationMs: Date.now() - startedAtMs,
+    });
+  });
+  next();
+});
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      useDefaults: false,
+      directives: {
+        defaultSrc: ["'none'"],
+        baseUri: ["'none'"],
+        frameAncestors: ["'none'"],
+        formAction: ["'none'"],
+        objectSrc: ["'none'"],
+        scriptSrc: ["'none'"],
+        styleSrc: ["'none'"],
+        imgSrc: ["'self'", "data:"],
+        connectSrc: cspConnectSrc,
+        fontSrc: ["'none'"],
+        manifestSrc: ["'none'"],
+        workerSrc: ["'none'"],
+      },
+    },
+    referrerPolicy: { policy: "no-referrer" },
+  })
+);
 app.use(cors({
   origin: (origin, callback) => {
     if (!origin) return callback(null, true);
-    if (corsOrigins.includes(origin) || isLocalDevOrigin(origin)) return callback(null, true);
+    if (corsOrigins.includes(origin)) return callback(null, true);
+    if (!isProduction && isLocalDevOrigin(origin)) return callback(null, true);
     return callback(new Error("Origin not allowed by CORS"));
   },
   methods: ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "x-wallet-address"],
+  allowedHeaders: ["Content-Type", "Authorization", "x-wallet-address", "x-request-id", "idempotency-key"],
+  credentials: true,
 }));
 app.use(express.json({ limit: process.env.JSON_BODY_LIMIT || "1mb" }));
 app.use(express.urlencoded({ extended: false, limit: process.env.FORM_BODY_LIMIT || "1mb" }));
@@ -210,6 +290,16 @@ type IssuerStatusEntry = {
   changedBy: string | null;
 };
 
+type RelayIdempotencyOperation = "issue" | "revoke";
+
+type RelayIdempotencyRecord = {
+  state: "in_progress" | "completed";
+  fingerprint: string;
+  createdAtMs: number;
+  statusCode: number | null;
+  body: unknown;
+};
+
 const certificateIndexCache = new Map<string, CertificateIndexEntry>();
 const certificateIndexRefreshMs = Number(process.env.CERT_INDEX_REFRESH_MS || 15000);
 const certificateIndexBatchSize = Math.max(
@@ -244,6 +334,44 @@ const useSupabaseIndexer = Boolean(supabaseUrl && supabaseServiceRoleKey);
 const relayTxModeEnabled = /^(1|true|yes|on)$/i.test(
   (process.env.ENABLE_RELAY_TX_MODE || "").trim()
 );
+const relayIdempotencyTtlMs = Math.max(
+  60_000,
+  Number(process.env.RELAY_IDEMPOTENCY_TTL_MS || 24 * 60 * 60 * 1000)
+);
+const certificateMetadataBackfillLimit = Math.max(
+  0,
+  Number(process.env.CERT_METADATA_BACKFILL_LIMIT || 0)
+);
+const relayIdempotencyStore = new Map<string, RelayIdempotencyRecord>();
+const indexerWriteQueueMaxAttempts = Math.max(
+  1,
+  Number(process.env.INDEXER_WRITE_QUEUE_MAX_ATTEMPTS || 6)
+);
+const indexerWriteQueueBaseDelayMs = Math.max(
+  200,
+  Number(process.env.INDEXER_WRITE_QUEUE_BASE_DELAY_MS || 1000)
+);
+const indexerWriteQueueMaxDelayMs = Math.max(
+  indexerWriteQueueBaseDelayMs,
+  Number(process.env.INDEXER_WRITE_QUEUE_MAX_DELAY_MS || 60000)
+);
+const healthRpcTimeoutMs = Math.max(500, Number(process.env.HEALTH_RPC_TIMEOUT_MS || 4000));
+const healthDbTimeoutMs = Math.max(500, Number(process.env.HEALTH_DB_TIMEOUT_MS || 4000));
+const healthIpfsTimeoutMs = Math.max(500, Number(process.env.HEALTH_IPFS_TIMEOUT_MS || 5000));
+const healthIndexerLagWarnBlocks = Math.max(
+  0,
+  Number(process.env.HEALTH_INDEXER_LAG_WARN_BLOCKS || 64)
+);
+const indexerWriteQueue = new Map<
+  string,
+  {
+    entry: CertificateIndexEntry;
+    attempts: number;
+    nextRunAtMs: number;
+    lastError: string;
+  }
+>();
+let indexerWriteFlushPromise: Promise<void> | null = null;
 
 if ((supabaseUrl && !supabaseServiceRoleKey) || (!supabaseUrl && supabaseServiceRoleKey)) {
   console.warn(
@@ -602,11 +730,16 @@ function toSingleString(value: string | string[] | undefined): string {
   return value || "";
 }
 
+function normalizeCertId(value: unknown): string {
+  return String(value ?? "").trim().toLowerCase();
+}
+
 function canonicalizeDemoCertId(certId: string): string {
-  const match = certId.trim().match(/^demo-cert-(\d+)$/i);
-  if (!match) return certId.trim();
+  const normalized = normalizeCertId(certId);
+  const match = normalized.match(/^demo-cert-(\d+)$/);
+  if (!match) return normalized;
   const padded = String(match[1]).padStart(3, "0");
-  return `Demo-cert-${padded}`;
+  return `demo-cert-${padded}`;
 }
 
 function isEventLog(log: unknown): log is EventLog {
@@ -616,8 +749,10 @@ function isEventLog(log: unknown): log is EventLog {
 function toCertificateRow(entry: CertificateIndexEntry): CertificateRow {
   const title = String(entry.title || "").trim();
   const institutionName = String(entry.institutionName || "").trim();
+  const certId = normalizeCertId(entry.certId);
+  const replacesCertId = normalizeCertId(entry.replacesCertId);
   return {
-    cert_id: entry.certId,
+    cert_id: certId,
     issuer: entry.issuer || null,
     ...(title ? { title } : {}),
     ...(institutionName ? { institution_name: institutionName } : {}),
@@ -625,7 +760,7 @@ function toCertificateRow(entry: CertificateIndexEntry): CertificateRow {
     file_cid: entry.fileCid || "",
     file_hash: entry.fileHash || "",
     version: entry.version,
-    replaces_cert_id: entry.replacesCertId || null,
+    replaces_cert_id: replacesCertId || null,
     revoked: entry.revoked,
     issue_tx: entry.issueTxHash || null,
     revoke_tx: entry.revokeTxHash || null,
@@ -638,7 +773,7 @@ function toCertificateRow(entry: CertificateIndexEntry): CertificateRow {
 function fromCertificateRow(row: CertificateRow): CertificateIndexEntry {
   const metadataCid = row.metadata_cid || "";
   return {
-    certId: row.cert_id,
+    certId: normalizeCertId(row.cert_id),
     cid: metadataCid,
     metadataCid,
     title: row.title || "",
@@ -647,7 +782,7 @@ function fromCertificateRow(row: CertificateRow): CertificateIndexEntry {
     fileHash: row.file_hash || "",
     issuer: (row.issuer || "").toLowerCase(),
     version: Number(row.version || 0),
-    replacesCertId: row.replaces_cert_id || "",
+    replacesCertId: normalizeCertId(row.replaces_cert_id || ""),
     issuedAt: Number(row.issued_at || 0),
     revoked: Boolean(row.revoked),
     revokedAt: row.revoked_at === null || row.revoked_at === undefined ? null : Number(row.revoked_at),
@@ -747,12 +882,99 @@ function isRpcQuotaError(err: unknown): boolean {
   );
 }
 
+function cleanupRelayIdempotencyStore(): void {
+  const now = Date.now();
+  for (const [key, record] of relayIdempotencyStore.entries()) {
+    if (record.createdAtMs + relayIdempotencyTtlMs < now) {
+      relayIdempotencyStore.delete(key);
+    }
+  }
+}
+
+function getRelayIdempotencyKey(req: express.Request, operation: RelayIdempotencyOperation): string | null {
+  const header = String(req.header("idempotency-key") || "").trim();
+  if (!header) return null;
+  return `${operation}:${header}`;
+}
+
+function stableSerializeForIdempotency(value: unknown): string {
+  if (value === null) return "null";
+  if (value === undefined) return "undefined";
+  if (typeof value === "bigint") return `bigint:${value.toString()}`;
+  if (typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableSerializeForIdempotency(item)).join(",")}]`;
+  }
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return `{${keys
+    .map((k) => `${JSON.stringify(k)}:${stableSerializeForIdempotency(obj[k])}`)
+    .join(",")}}`;
+}
+
+function makeRelayIdempotencyFingerprint(payload: unknown): string {
+  return crypto
+    .createHash("sha256")
+    .update(stableSerializeForIdempotency(payload), "utf8")
+    .digest("hex");
+}
+
+function startRelayIdempotency(
+  key: string,
+  fingerprint: string
+):
+  | { kind: "proceed" }
+  | { kind: "replay"; statusCode: number; body: unknown }
+  | { kind: "conflict"; message: string } {
+  cleanupRelayIdempotencyStore();
+  const existing = relayIdempotencyStore.get(key);
+  if (!existing) {
+    relayIdempotencyStore.set(key, {
+      state: "in_progress",
+      fingerprint,
+      createdAtMs: Date.now(),
+      statusCode: null,
+      body: null,
+    });
+    return { kind: "proceed" };
+  }
+  if (existing.fingerprint !== fingerprint) {
+    return {
+      kind: "conflict",
+      message: "Idempotency key reuse with different request payload is not allowed",
+    };
+  }
+  if (existing.state === "completed" && existing.statusCode !== null) {
+    return { kind: "replay", statusCode: existing.statusCode, body: existing.body };
+  }
+  return { kind: "conflict", message: "Request with this idempotency key is already in progress" };
+}
+
+function completeRelayIdempotency(key: string, fingerprint: string, statusCode: number, body: unknown): void {
+  relayIdempotencyStore.set(key, {
+    state: "completed",
+    fingerprint,
+    createdAtMs: Date.now(),
+    statusCode,
+    body,
+  });
+}
+
+function releaseRelayIdempotency(key: string, fingerprint: string): void {
+  const existing = relayIdempotencyStore.get(key);
+  if (!existing) return;
+  if (existing.fingerprint !== fingerprint) return;
+  if (existing.state !== "in_progress") return;
+  relayIdempotencyStore.delete(key);
+}
+
 async function loadCertificateEntryFromChain(
   contract: Contract,
   certId: string,
   opts?: { issueTxHash?: string; issueBlockNumber?: number | null; revokeTxHash?: string | null; revokeBlockNumber?: number | null }
 ): Promise<CertificateIndexEntry> {
-  const cert = (await contract.getFunction("getCertificate").staticCall(certId)) as [
+  const normalizedCertId = normalizeCertId(certId);
+  const cert = (await contract.getFunction("getCertificate").staticCall(normalizedCertId)) as [
     string,
     string,
     string,
@@ -765,7 +987,7 @@ async function loadCertificateEntryFromChain(
   ];
 
   return {
-    certId,
+    certId: normalizedCertId,
     cid: String(cert[0] || ""),
     metadataCid: String(cert[0] || ""),
     title: "",
@@ -774,7 +996,7 @@ async function loadCertificateEntryFromChain(
     fileHash: String(cert[2] || "").toLowerCase(),
     issuer: String(cert[3] || "").toLowerCase(),
     version: Number(cert[4] || 0),
-    replacesCertId: String(cert[5] || ""),
+    replacesCertId: normalizeCertId(cert[5]),
     issuedAt: Number(cert[6] || 0),
     revoked: Boolean(cert[7]),
     revokedAt: null,
@@ -1015,6 +1237,75 @@ async function upsertSupabaseCertificates(entries: CertificateIndexEntry[]): Pro
   });
 }
 
+function queueIndexerWrites(entries: CertificateIndexEntry[], reason: string): void {
+  const now = Date.now();
+  for (const entry of entries) {
+    const existing = indexerWriteQueue.get(entry.certId);
+    indexerWriteQueue.set(entry.certId, {
+      entry: { ...entry },
+      attempts: existing?.attempts || 0,
+      nextRunAtMs: existing?.nextRunAtMs || now,
+      lastError: reason,
+    });
+  }
+}
+
+async function flushIndexerWriteQueue(): Promise<void> {
+  if (!useSupabaseIndexer) return;
+  if (indexerWriteFlushPromise) return indexerWriteFlushPromise;
+  indexerWriteFlushPromise = (async () => {
+    const now = Date.now();
+    const due = Array.from(indexerWriteQueue.values()).filter((item) => item.nextRunAtMs <= now);
+    if (due.length === 0) return;
+
+    const batch = due.map((item) => item.entry);
+    try {
+      await upsertSupabaseCertificates(batch);
+      for (const item of due) {
+        indexerWriteQueue.delete(item.entry.certId);
+      }
+      if (batch.length > 0) {
+        logEvent("info", "indexer_write_queue_flush_ok", {
+          count: batch.length,
+          remaining: indexerWriteQueue.size,
+        });
+      }
+    } catch (err: any) {
+      const errMsg = describeAxiosError(err);
+      for (const item of due) {
+        const attempts = item.attempts + 1;
+        if (attempts >= indexerWriteQueueMaxAttempts) {
+          indexerWriteQueue.delete(item.entry.certId);
+          logEvent("error", "indexer_write_queue_drop", {
+            certId: item.entry.certId,
+            attempts,
+            error: errMsg,
+          });
+          continue;
+        }
+        const delay = Math.min(
+          indexerWriteQueueMaxDelayMs,
+          indexerWriteQueueBaseDelayMs * Math.pow(2, attempts - 1)
+        );
+        indexerWriteQueue.set(item.entry.certId, {
+          entry: item.entry,
+          attempts,
+          nextRunAtMs: Date.now() + delay,
+          lastError: errMsg,
+        });
+      }
+      logEvent("warn", "indexer_write_queue_flush_retry", {
+        attempted: due.length,
+        remaining: indexerWriteQueue.size,
+        error: errMsg,
+      });
+    }
+  })().finally(() => {
+    indexerWriteFlushPromise = null;
+  });
+  return indexerWriteFlushPromise;
+}
+
 async function loadSupabaseCertificatesIntoCache(): Promise<void> {
   const rows = await supabaseRequest<CertificateRow[]>({
     method: "GET",
@@ -1036,11 +1327,19 @@ async function persistCertificates(entries: CertificateIndexEntry[]): Promise<vo
   if (useSupabaseIndexer) {
     try {
       await upsertSupabaseCertificates(entries);
+      if (indexerWriteQueue.size > 0) {
+        void flushIndexerWriteQueue();
+      }
       return;
     } catch (err: any) {
-      console.error("Supabase certificates upsert failed:", describeAxiosError(err));
-      // Do not advance index state when persistence fails, otherwise rows are skipped permanently.
-      throw err;
+      const errMsg = describeAxiosError(err);
+      queueIndexerWrites(entries, errMsg);
+      logEvent("warn", "supabase_certificates_upsert_queued", {
+        queued: entries.length,
+        queueDepth: indexerWriteQueue.size,
+        error: errMsg,
+      });
+      return;
     }
   }
 }
@@ -1145,7 +1444,7 @@ async function hydrateIssuerCacheFromPersistentStore(): Promise<void> {
 }
 
 function applyIssuedLog(log: EventLog): void {
-  const certId = String(log.args?.[0] ?? "");
+  const certId = normalizeCertId(log.args?.[0]);
   if (!certId || certId === "[object Object]") return;
 
   certificateIndexCache.set(certId, {
@@ -1156,7 +1455,7 @@ function applyIssuedLog(log: EventLog): void {
     fileHash: "",
     issuer: String(log.args?.[2] ?? "").toLowerCase(),
     version: Number(log.args?.[3] ?? 1),
-    replacesCertId: String(log.args?.[4] ?? ""),
+    replacesCertId: normalizeCertId(log.args?.[4]),
     issuedAt: Number(log.args?.[5] ?? 0),
     revoked: false,
     revokedAt: null,
@@ -1168,7 +1467,7 @@ function applyIssuedLog(log: EventLog): void {
 }
 
 function applyRevokedLog(log: EventLog): void {
-  const certId = String(log.args?.[0] ?? "");
+  const certId = normalizeCertId(log.args?.[0]);
   if (!certId || certId === "[object Object]") return;
 
   const current = certificateIndexCache.get(certId);
@@ -1200,10 +1499,9 @@ function applyRevokedLog(log: EventLog): void {
 }
 
 function readDirectCertId(arg: unknown): string | null {
-  if (typeof arg !== "string") return null;
-  const trimmed = arg.trim();
-  if (!trimmed || trimmed === "[object Object]") return null;
-  return trimmed;
+  const normalized = normalizeCertId(arg);
+  if (!normalized || normalized === "[object object]") return null;
+  return normalized;
 }
 
 async function resolveCertIdFromTx(contract: Contract, txHash: string, fnName: string): Promise<string | null> {
@@ -1241,12 +1539,143 @@ async function enrichEntryFromContract(contract: Contract, entry: CertificateInd
     entry.fileHash = String(cert[2] || "").toLowerCase();
     entry.issuer = String(cert[3] || "").toLowerCase();
     entry.version = Number(cert[4] || 0n);
-    entry.replacesCertId = cert[5] || "";
+    entry.replacesCertId = normalizeCertId(cert[5]);
     entry.issuedAt = Number(cert[6] || 0n);
     entry.revoked = Boolean(cert[7]);
   } catch {
     // Keep event-derived values if contract read fails.
   }
+}
+
+function normalizeMetadataLabel(value: unknown): string {
+  return String(value ?? "").trim();
+}
+
+async function validateAndBackfillCertificateMetadataLabels(options?: {
+  dryRun?: boolean;
+  limit?: number;
+}): Promise<{
+  dryRun: boolean;
+  scanned: number;
+  matched: number;
+  mismatched: number;
+  updated: number;
+  fetchErrors: number;
+  missingMetadataCid: number;
+  samples: Array<{
+    certId: string;
+    metadataCid: string;
+    dbTitle: string;
+    metadataTitle: string;
+    dbInstitutionName: string;
+    metadataInstitutionName: string;
+    error?: string;
+  }>;
+}> {
+  const dryRun = Boolean(options?.dryRun);
+  const limitRaw = Number(options?.limit || 0);
+  const requestedLimit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.floor(limitRaw) : 0;
+  const defaultLimit = Number.isFinite(certificateMetadataBackfillLimit) && certificateMetadataBackfillLimit > 0
+    ? certificateMetadataBackfillLimit
+    : 0;
+  const effectiveLimit = requestedLimit > 0 ? requestedLimit : defaultLimit;
+  const maxToScan = effectiveLimit > 0 ? effectiveLimit : Number.POSITIVE_INFINITY;
+
+  const entries = Array.from(certificateIndexCache.values())
+    .sort((a, b) => a.certId.localeCompare(b.certId))
+    .slice(0, Number.isFinite(maxToScan) ? maxToScan : undefined);
+
+  const toPersist: CertificateIndexEntry[] = [];
+  let scanned = 0;
+  let matched = 0;
+  let mismatched = 0;
+  let updated = 0;
+  let fetchErrors = 0;
+  let missingMetadataCid = 0;
+  const samples: Array<{
+    certId: string;
+    metadataCid: string;
+    dbTitle: string;
+    metadataTitle: string;
+    dbInstitutionName: string;
+    metadataInstitutionName: string;
+    error?: string;
+  }> = [];
+
+  for (const entry of entries) {
+    scanned += 1;
+    const metadataCid = String(entry.metadataCid || entry.cid || "").trim();
+    if (!metadataCid) {
+      missingMetadataCid += 1;
+      continue;
+    }
+
+    try {
+      const metadata = await fetchCidJson<Record<string, unknown>>(metadataCid);
+      const metadataTitle = normalizeMetadataLabel(metadata?.title);
+      const metadataInstitutionName = normalizeMetadataLabel(
+        metadata?.institutionName ?? metadata?.institution_name
+      );
+      const dbTitle = normalizeMetadataLabel(entry.title);
+      const dbInstitutionName = normalizeMetadataLabel(entry.institutionName);
+      const isConsistent =
+        dbTitle === metadataTitle &&
+        dbInstitutionName === metadataInstitutionName;
+
+      if (isConsistent) {
+        matched += 1;
+        continue;
+      }
+
+      mismatched += 1;
+      if (samples.length < 100) {
+        samples.push({
+          certId: entry.certId,
+          metadataCid,
+          dbTitle,
+          metadataTitle,
+          dbInstitutionName,
+          metadataInstitutionName,
+        });
+      }
+
+      if (!dryRun) {
+        entry.title = metadataTitle;
+        entry.institutionName = metadataInstitutionName;
+        toPersist.push(entry);
+      }
+    } catch (err: any) {
+      fetchErrors += 1;
+      if (samples.length < 100) {
+        samples.push({
+          certId: entry.certId,
+          metadataCid,
+          dbTitle: normalizeMetadataLabel(entry.title),
+          metadataTitle: "",
+          dbInstitutionName: normalizeMetadataLabel(entry.institutionName),
+          metadataInstitutionName: "",
+          error: err?.message || String(err),
+        });
+      }
+    }
+  }
+
+  if (!dryRun && toPersist.length > 0) {
+    await persistCertificates(toPersist);
+    certificateIndexLastUpdatedAtMs = Date.now();
+    updated = toPersist.length;
+  }
+
+  return {
+    dryRun,
+    scanned,
+    matched,
+    mismatched,
+    updated,
+    fetchErrors,
+    missingMetadataCid,
+    samples,
+  };
 }
 
 function isLogRangeLimitError(err: unknown): boolean {
@@ -1366,7 +1795,7 @@ async function syncCertificateIndexToLatest(): Promise<void> {
           fileHash: "",
           issuer: String(log.args?.[2] ?? "").toLowerCase(),
           version: Number(log.args?.[3] ?? 1),
-          replacesCertId: String(log.args?.[4] ?? ""),
+          replacesCertId: normalizeCertId(log.args?.[4]),
           issuedAt: Number(log.args?.[5] ?? 0),
           revoked: false,
           revokedAt: null,
@@ -1626,6 +2055,11 @@ function startCertificateIndexerPolling(): void {
         issuerIndexSyncPromise = null;
       });
   }, issuerIndexPollMs);
+
+  setInterval(() => {
+    if (!useSupabaseIndexer) return;
+    void flushIndexerWriteQueue();
+  }, Math.min(indexerWriteQueueBaseDelayMs, 5000));
 }
 
 function buildCertificateHistory(seedCertId: string): {
@@ -1633,7 +2067,8 @@ function buildCertificateHistory(seedCertId: string): {
   chain: CertificateIndexEntry[];
 } | null {
   const byCertId = certificateIndexCache;
-  const seed = byCertId.get(seedCertId);
+  const normalizedSeedCertId = normalizeCertId(seedCertId);
+  const seed = byCertId.get(normalizedSeedCertId);
   if (!seed) return null;
 
   const visited = new Set<string>();
@@ -1643,7 +2078,7 @@ function buildCertificateHistory(seedCertId: string): {
   while (root.replacesCertId) {
     if (visited.has(root.certId)) break;
     visited.add(root.certId);
-    const parent = byCertId.get(root.replacesCertId);
+    const parent = byCertId.get(normalizeCertId(root.replacesCertId));
     if (!parent) break;
     root = parent;
   }
@@ -1659,7 +2094,7 @@ function buildCertificateHistory(seedCertId: string): {
     forwardVisited.add(current.certId);
 
     const children: CertificateIndexEntry[] = Array.from(byCertId.values())
-      .filter((item) => item.replacesCertId === current.certId)
+      .filter((item) => normalizeCertId(item.replacesCertId) === current.certId)
       .sort((a, b) => {
         if (a.version !== b.version) return a.version - b.version;
         return a.issuedAt - b.issuedAt;
@@ -1713,11 +2148,119 @@ function requireRelayTxModeEnabled(res: express.Response): boolean {
   return false;
 }
 
-app.get("/health", (_req, res) => {
-  res.json({
-    ok: true,
+async function probeRpcHealth(): Promise<{ ok: boolean; latestBlock: number | null; error?: string }> {
+  try {
+    const provider = new JsonRpcProvider(resolveRpcUrl());
+    const latestBlock = await withTimeout(
+      provider.getBlockNumber(),
+      healthRpcTimeoutMs,
+      `rpc health timeout after ${healthRpcTimeoutMs}ms`
+    );
+    return { ok: Number.isFinite(latestBlock), latestBlock };
+  } catch (err: any) {
+    return { ok: false, latestBlock: null, error: err?.message || String(err) };
+  }
+}
+
+async function probeDbHealth(): Promise<{ ok: boolean; enabled: boolean; error?: string }> {
+  if (!useSupabaseIndexer) {
+    return { ok: true, enabled: false };
+  }
+  try {
+    await withTimeout(
+      supabaseRequest<unknown>({
+        method: "GET",
+        tablePath: "indexer_state",
+        params: { select: "id", limit: "1" },
+      }),
+      healthDbTimeoutMs,
+      `db health timeout after ${healthDbTimeoutMs}ms`
+    );
+    return { ok: true, enabled: true };
+  } catch (err: any) {
+    return { ok: false, enabled: true, error: describeAxiosError(err) };
+  }
+}
+
+async function probeIpfsPinningHealth(): Promise<{ ok: boolean; enabled: boolean; error?: string }> {
+  const jwt = String(process.env.PINATA_JWT || "").trim();
+  if (!jwt) return { ok: false, enabled: false, error: "PINATA_JWT not configured" };
+  try {
+    await withTimeout(
+      axios.get("https://api.pinata.cloud/data/testAuthentication", {
+        headers: { Authorization: `Bearer ${jwt}` },
+        validateStatus: (status) => status >= 200 && status < 300,
+      }),
+      healthIpfsTimeoutMs,
+      `ipfs health timeout after ${healthIpfsTimeoutMs}ms`
+    );
+    return { ok: true, enabled: true };
+  } catch (err: any) {
+    return {
+      ok: false,
+      enabled: true,
+      error: err?.response?.data?.error || err?.message || String(err),
+    };
+  }
+}
+
+function getIndexerLagStatus(latestBlock: number | null): {
+  ok: boolean;
+  latestBlock: number | null;
+  certificateLagBlocks: number | null;
+  issuerLagBlocks: number | null;
+  queueDepth: number;
+  lastError: string;
+} {
+  if (!Number.isFinite(latestBlock as number)) {
+    return {
+      ok: false,
+      latestBlock,
+      certificateLagBlocks: null,
+      issuerLagBlocks: null,
+      queueDepth: indexerWriteQueue.size,
+      lastError: certificateIndexLastError || issuerIndexLastError || "",
+    };
+  }
+  const lb = Number(latestBlock);
+  const certificateLagBlocks = Math.max(0, lb - Math.max(certificateIndexLastIndexedBlock, 0));
+  const issuerLagBlocks = Math.max(0, lb - Math.max(issuerIndexLastIndexedBlock, 0));
+  const ok =
+    certificateLagBlocks <= healthIndexerLagWarnBlocks &&
+    issuerLagBlocks <= healthIndexerLagWarnBlocks &&
+    !certificateIndexLastError &&
+    !issuerIndexLastError;
+  return {
+    ok,
+    latestBlock: lb,
+    certificateLagBlocks,
+    issuerLagBlocks,
+    queueDepth: indexerWriteQueue.size,
+    lastError: certificateIndexLastError || issuerIndexLastError || "",
+  };
+}
+
+app.get("/health", async (req, res) => {
+  const [rpc, db, ipfs] = await Promise.all([
+    probeRpcHealth(),
+    probeDbHealth(),
+    probeIpfsPinningHealth(),
+  ]);
+  const indexer = getIndexerLagStatus(rpc.latestBlock);
+  const ok = rpc.ok && db.ok && ipfs.ok && indexer.ok;
+  const statusCode = ok ? 200 : 503;
+  const payload = {
+    ok,
+    requestId: getRequestId(req),
     relayTxModeEnabled,
-  });
+    checks: {
+      rpc,
+      db,
+      ipfs,
+      indexer,
+    },
+  };
+  return res.status(statusCode).json(payload);
 });
 
 /**
@@ -1834,11 +2377,11 @@ app.post("/api/pin", ...institutionPinGuard(authRateLimiter), pinRateLimiter, up
     const jwt = process.env.PINATA_JWT;
     if (!jwt) return res.status(500).json({ error: "PINATA_JWT not set" });
 
-    const certId = String(req.body?.certId || "").trim();
+    const certId = normalizeCertId(req.body?.certId);
     const title = String(req.body?.title || "").trim();
     const recipient = String(req.body?.recipient || "").trim();
     const institutionName = String(req.body?.institutionName || "").trim();
-    const replacesCertId = String(req.body?.replacesCertId || "").trim();
+    const replacesCertId = normalizeCertId(req.body?.replacesCertId);
     const versionRaw = Number(req.body?.version);
     const version = Number.isFinite(versionRaw) && versionRaw > 0 ? Math.floor(versionRaw) : 1;
     const requestOrigin = String(req.headers.origin || "").trim();
@@ -1990,7 +2533,7 @@ app.get("/api/verify/:certId", verifyRateLimiter, async (req, res) => {
   let fileCidForError: string | undefined;
 
   try {
-    const requestedCertId = toSingleString(req.params.certId).trim();
+    const requestedCertId = normalizeCertId(toSingleString(req.params.certId));
     if (!requestedCertId) return res.status(400).json({ error: "certId is required" });
     const certIdCandidates = Array.from(
       new Set([requestedCertId, canonicalizeDemoCertId(requestedCertId)])
@@ -2035,7 +2578,8 @@ app.get("/api/verify/:certId", verifyRateLimiter, async (req, res) => {
       return res.status(404).json({ error: "Certificate not found", certId: requestedCertId });
     }
 
-    const [metadataCid, fileCidOnChain, onChainHash, issuer, version, replacesCertId, issuedAt, revoked] = chainTuple;
+    const [metadataCid, fileCidOnChain, onChainHash, issuer, version, replacesCertIdRaw, issuedAt, revoked] = chainTuple;
+    const replacesCertId = normalizeCertId(replacesCertIdRaw);
     metadataCidForError = metadataCid;
     if (!String(metadataCid || "").trim()) {
       return res.status(422).json({
@@ -2088,7 +2632,7 @@ app.get("/api/verify/:certId", verifyRateLimiter, async (req, res) => {
   } catch (err: any) {
     if (isCertificateNotFoundError(err)) {
       return res.status(404).json({
-        certId: req.params.certId,
+        certId: normalizeCertId(req.params.certId),
         exists: false,
         status: "NOT_FOUND",
       });
@@ -2104,7 +2648,7 @@ app.get("/api/verify/:certId", verifyRateLimiter, async (req, res) => {
     if (err instanceof GatewayFetchError) {
       return res.status(502).json({
         error: "Gateway fetch failed during verification",
-        certId: req.params.certId,
+        certId: normalizeCertId(req.params.certId),
         metadataCid: metadataCidForError,
         fileCid: fileCidForError,
         attempts: err.attempts,
@@ -2116,6 +2660,188 @@ app.get("/api/verify/:certId", verifyRateLimiter, async (req, res) => {
       error: "Verification failed",
       message: err?.message || String(err),
     });
+  }
+});
+
+async function buildVerificationProof(certIdInput: string): Promise<{
+  certId: string;
+  status: "VALID" | "REVOKED" | "TAMPERED";
+  verifiedAtIso: string;
+  txHash: string;
+  revokeTxHash: string | null;
+  metadataCid: string;
+  fileCid: string;
+  onChainHash: string;
+  computedHash: string;
+  metadataFileHash: string | null;
+  integrityMatch: boolean;
+  metadataHashMatch: boolean | null;
+  issuer: string;
+  version: number;
+  replacesCertId: string;
+  issuedAt: number;
+  revoked: boolean;
+  title: string;
+  institutionName: string;
+}> {
+  const requestedCertId = normalizeCertId(certIdInput);
+  if (!requestedCertId) {
+    throw new Error("certId is required");
+  }
+
+  const certIdCandidates = Array.from(new Set([requestedCertId, canonicalizeDemoCertId(requestedCertId)]));
+  const provider = new JsonRpcProvider(resolveRpcUrl());
+  const contract = new Contract(loadDeploymentAddress(), CERTIFICATE_REGISTRY_ABI, provider);
+  let certId = requestedCertId;
+  let chainTuple:
+    | [string, string, string, string, bigint, string, bigint, boolean, boolean]
+    | null = null;
+  for (const candidate of certIdCandidates) {
+    try {
+      const tuple = (await contract.getFunction("getCertificate").staticCall(candidate)) as [
+        string,
+        string,
+        string,
+        string,
+        bigint,
+        string,
+        bigint,
+        boolean,
+        boolean,
+      ];
+      if (!tuple[8]) continue;
+      certId = candidate;
+      chainTuple = tuple;
+      break;
+    } catch {
+      // Try next candidate.
+    }
+  }
+  if (!chainTuple) {
+    throw new Error("Certificate not found");
+  }
+
+  const [metadataCid, fileCidOnChain, onChainHash, issuer, version, replacesCertIdRaw, issuedAt, revoked] = chainTuple;
+  const replacesCertId = normalizeCertId(replacesCertIdRaw);
+  if (!String(metadataCid || "").trim()) {
+    throw new Error("Certificate metadata CID is missing on-chain");
+  }
+  const metadata = await fetchCidJson<PinnedMetadata>(metadataCid);
+  const metadataFileCid = String(metadata?.fileCid || "").trim();
+  const rawMetadataFileHash = String(metadata?.fileHash || "").trim().toLowerCase();
+  const metadataFileHash =
+    rawMetadataFileHash && !rawMetadataFileHash.startsWith("0x")
+      ? `0x${rawMetadataFileHash}`
+      : rawMetadataFileHash || null;
+  const resolvedFileCid = metadataFileCid || fileCidOnChain;
+  if (!resolvedFileCid) {
+    throw new Error("Metadata missing fileCid and no on-chain fileCid available");
+  }
+  const fileBytes = await fetchCidBytes(resolvedFileCid);
+  const computedHash = sha256Hex0x(fileBytes);
+  const integrityMatch = computedHash.toLowerCase() === String(onChainHash).toLowerCase();
+  const metadataHashMatch = metadataFileHash ? metadataFileHash === computedHash.toLowerCase() : null;
+  const status = integrityMatch && !revoked ? "VALID" : revoked ? "REVOKED" : "TAMPERED";
+
+  await ensureCertificateIndexFresh();
+  const history = buildCertificateHistory(certId);
+  const historyEntry = history?.chain.find((item) => item.certId === certId) || null;
+
+  return {
+    certId,
+    status,
+    verifiedAtIso: new Date().toISOString(),
+    txHash: String(historyEntry?.issueTxHash || ""),
+    revokeTxHash: historyEntry?.revokeTxHash || null,
+    metadataCid: String(metadataCid || ""),
+    fileCid: String(resolvedFileCid || ""),
+    onChainHash: String(onChainHash || ""),
+    computedHash,
+    metadataFileHash,
+    integrityMatch,
+    metadataHashMatch,
+    issuer: String(issuer || ""),
+    version: Number(version || 0),
+    replacesCertId,
+    issuedAt: Number(issuedAt || 0),
+    revoked: Boolean(revoked),
+    title: String(metadata?.title || "").trim(),
+    institutionName: String(metadata?.institutionName || metadata?.institution_name || "").trim(),
+  };
+}
+
+app.get("/api/proof/:certId.json", async (req, res) => {
+  try {
+    const proof = await buildVerificationProof(toSingleString(req.params.certId));
+    return res.json(proof);
+  } catch (err: any) {
+    if (isCertificateNotFoundError(err) || String(err?.message || "").toLowerCase().includes("not found")) {
+      return res.status(404).json({ error: "Certificate not found" });
+    }
+    if (err instanceof GatewayFetchError) {
+      return res.status(502).json({ error: "Gateway fetch failed", attempts: err.attempts });
+    }
+    return res.status(500).json({ error: "Proof generation failed", message: err?.message || String(err) });
+  }
+});
+
+app.get("/api/proof/:certId.pdf", async (req, res) => {
+  try {
+    const proof = await buildVerificationProof(toSingleString(req.params.certId));
+    const pdf = await PDFDocument.create();
+    const page = pdf.addPage([595, 842]);
+    const font = await pdf.embedFont(StandardFonts.Helvetica);
+    const titleFont = await pdf.embedFont(StandardFonts.HelveticaBold);
+    let y = 800;
+    page.drawText("Certificate Verification Proof", {
+      x: 40,
+      y,
+      size: 18,
+      font: titleFont,
+      color: rgb(0.1, 0.14, 0.2),
+    });
+    y -= 30;
+    const lines: Array<[string, string]> = [
+      ["Status", proof.status],
+      ["certId", proof.certId],
+      ["Issuer", proof.issuer],
+      ["txHash", proof.txHash || "-"],
+      ["revokeTxHash", proof.revokeTxHash || "-"],
+      ["metadataCid", proof.metadataCid],
+      ["fileCid", proof.fileCid],
+      ["onChainHash", proof.onChainHash],
+      ["computedHash", proof.computedHash],
+      ["metadataFileHash", proof.metadataFileHash || "-"],
+      ["integrityMatch", String(proof.integrityMatch)],
+      ["metadataHashMatch", String(proof.metadataHashMatch)],
+      ["verifiedAt", proof.verifiedAtIso],
+    ];
+    for (const [label, value] of lines) {
+      if (y < 50) break;
+      page.drawText(`${label}: ${value}`, {
+        x: 40,
+        y,
+        size: 10,
+        font,
+        color: rgb(0.15, 0.18, 0.22),
+      });
+      y -= 16;
+    }
+    const bytes = await pdf.save();
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${proof.certId}-verification-proof.pdf"`
+    );
+    return res.send(Buffer.from(bytes));
+  } catch (err: any) {
+    if (isCertificateNotFoundError(err) || String(err?.message || "").toLowerCase().includes("not found")) {
+      return res.status(404).json({ error: "Certificate not found" });
+    }
+    if (err instanceof GatewayFetchError) {
+      return res.status(502).json({ error: "Gateway fetch failed", attempts: err.attempts });
+    }
+    return res.status(500).json({ error: "Proof generation failed", message: err?.message || String(err) });
   }
 });
 
@@ -2222,6 +2948,41 @@ app.get("/api/indexer/status", async (_req, res) => {
   }
 });
 
+/**
+ * Validate/backfill title + institution_name consistency between metadata JSON and stored rows.
+ * Body (optional): { dryRun?: boolean, limit?: number }
+ */
+app.post("/api/indexer/backfill-metadata-labels", async (req, res) => {
+  try {
+    if (!useSupabaseIndexer) {
+      return res.status(400).json({
+        error: "Supabase indexer is not enabled",
+        required: ["SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY"],
+      });
+    }
+
+    await ensureCertificateIndexFresh();
+    const dryRun = Boolean(req.body?.dryRun);
+    const limitRaw = Number(req.body?.limit);
+    const limit = Number.isFinite(limitRaw) && limitRaw > 0 ? Math.floor(limitRaw) : undefined;
+
+    const report = await validateAndBackfillCertificateMetadataLabels(
+      limit === undefined ? { dryRun } : { dryRun, limit }
+    );
+
+    return res.json({
+      ok: true,
+      ...report,
+    });
+  } catch (err: any) {
+    console.error("Metadata label backfill/validation failed:", err?.message || String(err));
+    return res.status(500).json({
+      error: "Metadata label backfill/validation failed",
+      message: err?.message || String(err),
+    });
+  }
+});
+
 app.get("/api/issuers", async (_req, res) => {
   try {
     triggerIssuerIndexerRefreshIfNeeded();
@@ -2239,6 +3000,33 @@ app.get("/api/issuers", async (_req, res) => {
     console.error("Issuer index failed:", err?.message || String(err));
     return res.status(500).json({
       error: "Issuer index failed",
+      message: err?.message || String(err),
+    });
+  }
+});
+
+app.get("/api/issuers/:issuer/status", async (req, res) => {
+  try {
+    const issuer = normalizeAddress(toSingleString(req.params.issuer));
+    if (!issuer) {
+      return res.status(400).json({ error: "Invalid issuer address" });
+    }
+    const issuerLower = issuer.toLowerCase();
+    const onChainAuthorized = await ensureAddressIsAuthorizedIssuer(issuerLower);
+    const indexed = issuerStatusCache.get(issuerLower) || null;
+    return res.json({
+      issuer: issuerLower,
+      onChainAuthorized,
+      indexedAuthorized: indexed ? Boolean(indexed.isAuthorized) : null,
+      indexedLastBlock: indexed?.lastBlockNumber || null,
+      indexerRefreshedAt: new Date(issuerIndexLastUpdatedAtMs).toISOString(),
+      indexerSyncRunning: Boolean(issuerIndexSyncPromise || issuerIndexBootstrapPromise),
+      indexerLastError: issuerIndexLastError || null,
+    });
+  } catch (err: any) {
+    console.error("Issuer status failed:", err?.message || String(err));
+    return res.status(500).json({
+      error: "Issuer status failed",
       message: err?.message || String(err),
     });
   }
@@ -2281,7 +3069,7 @@ app.post("/api/indexer/sync-issuers", async (_req, res) => {
  */
 app.post("/api/indexer/upsert-cert", async (req, res) => {
   try {
-    const certId = String(req.body?.certId || "").trim();
+    const certId = normalizeCertId(req.body?.certId);
     if (!certId) {
       return res.status(400).json({ error: "certId is required" });
     }
@@ -2335,7 +3123,7 @@ app.post("/api/indexer/upsert-cert", async (req, res) => {
 app.get("/api/certificates/:certId/history", async (req, res) => {
   try {
     await ensureCertificateIndexFresh();
-    const certId = toSingleString(req.params.certId).trim();
+    const certId = normalizeCertId(toSingleString(req.params.certId));
     if (!certId) {
       return res.status(400).json({ error: "certId is required" });
     }
@@ -2382,20 +3170,35 @@ app.get("/api/certificates/:certId/history", async (req, res) => {
  *   metadata?: object, // optional extra fields merged into pinned metadata JSON
  *   metadataCid?: string // optional pre-pinned metadata CID
  * }
+ *
+ * Optional header: Idempotency-Key: <unique-client-key>
  */
 app.post("/api/issue", async (req, res) => {
+  let issueIdempotency: { key: string; fingerprint: string } | null = null;
+  const respondIssue = (statusCode: number, body: unknown) => {
+    if (issueIdempotency) {
+      completeRelayIdempotency(
+        issueIdempotency.key,
+        issueIdempotency.fingerprint,
+        statusCode,
+        body
+      );
+    }
+    return res.status(statusCode).json(body);
+  };
+
   try {
     if (!requireRelayTxModeEnabled(res)) return;
 
     const auth = await ensureJwtAddressIsAuthorizedIssuer(req, res);
     if (!auth) return;
 
-    const certId = String(req.body?.certId || "").trim();
+    const certId = normalizeCertId(req.body?.certId);
     const fileCid = String(req.body?.fileCid || "").trim();
     const fileHash = String(req.body?.fileHash || "").trim();
     const versionRaw = req.body?.version;
     const version = versionRaw === undefined || versionRaw === null ? 1 : Number(versionRaw);
-    const replacesCertId = String(req.body?.replacesCertId || "").trim();
+    const replacesCertId = normalizeCertId(req.body?.replacesCertId);
     const providedMetadataCid = String(req.body?.metadataCid || "").trim();
     const metadataInput = req.body?.metadata;
 
@@ -2430,10 +3233,33 @@ app.post("/api/issue", async (req, res) => {
       });
     }
 
+    const idempotencyKey = getRelayIdempotencyKey(req, "issue");
+    if (idempotencyKey) {
+      const fingerprint = makeRelayIdempotencyFingerprint({
+        operation: "issue",
+        issuer: auth.address.toLowerCase(),
+        certId,
+        fileCid,
+        fileHash: fileHash.toLowerCase(),
+        version,
+        replacesCertId,
+        metadataCid: providedMetadataCid,
+        metadata: metadataInput ?? null,
+      });
+      const idempotencyState = startRelayIdempotency(idempotencyKey, fingerprint);
+      if (idempotencyState.kind === "replay") {
+        return res.status(idempotencyState.statusCode).json(idempotencyState.body);
+      }
+      if (idempotencyState.kind === "conflict") {
+        return res.status(409).json({ error: idempotencyState.message });
+      }
+      issueIdempotency = { key: idempotencyKey, fingerprint };
+    }
+
     const readContract = getReadOnlyContract();
     try {
       await readContract.getFunction("getCertificate").staticCall(certId);
-      return res.status(409).json({
+      return respondIssue(409, {
         error: "Certificate already exists",
         certId,
       });
@@ -2469,7 +3295,7 @@ app.post("/api/issue", async (req, res) => {
         ];
       } catch (err) {
         if (isCertificateNotFoundError(err)) {
-          return res.status(400).json({
+          return respondIssue(400, {
             error: "Replaced certificate not found",
             replacesCertId,
           });
@@ -2480,13 +3306,13 @@ app.post("/api/issue", async (req, res) => {
       const replacedRevoked = replacedCert[7];
       const replacedIssuer = String(replacedCert[3] || "").toLowerCase();
       if (!replacedRevoked) {
-        return res.status(400).json({
+        return respondIssue(400, {
           error: "Replaced certificate must be revoked before issuing a replacement",
           replacesCertId,
         });
       }
       if (replacedIssuer !== auth.address.toLowerCase()) {
-        return res.status(403).json({
+        return respondIssue(403, {
           error: "Only original issuer can replace this certificate",
           replacesCertId,
         });
@@ -2494,9 +3320,14 @@ app.post("/api/issue", async (req, res) => {
     }
 
     const signer = createRelaySignerOrRespond(res);
-    if (!signer) return;
+    if (!signer) {
+      if (issueIdempotency) {
+        releaseRelayIdempotency(issueIdempotency.key, issueIdempotency.fingerprint);
+      }
+      return;
+    }
     if (signer.address.toLowerCase() !== auth.address.toLowerCase()) {
-      return res.status(403).json({
+      return respondIssue(403, {
         error: "Authenticated wallet does not match backend issuer signer",
       });
     }
@@ -2510,7 +3341,7 @@ app.post("/api/issue", async (req, res) => {
 
     if (!metadataCid) {
       if (!pinJwt) {
-        return res.status(500).json({
+        return respondIssue(500, {
           error: "PINATA_JWT is not configured and metadataCid was not provided",
         });
       }
@@ -2545,7 +3376,7 @@ app.post("/api/issue", async (req, res) => {
     );
     const receipt = await tx.wait();
 
-    return res.json({
+    return respondIssue(200, {
       ok: true,
       certId,
       metadataCid,
@@ -2559,6 +3390,9 @@ app.post("/api/issue", async (req, res) => {
       blockNumber: receipt?.blockNumber ?? null,
     });
   } catch (err: any) {
+    if (issueIdempotency) {
+      releaseRelayIdempotency(issueIdempotency.key, issueIdempotency.fingerprint);
+    }
     console.error("Issue failed:", err?.shortMessage || err?.message);
     const issueError = String(err?.shortMessage || err?.message || "");
     if (issueError.toLowerCase().includes("missing revert data")) {
@@ -2578,15 +3412,29 @@ app.post("/api/issue", async (req, res) => {
  * Requires JWT bearer auth and an authorized on-chain issuer wallet.
  *
  * Body: { certId: string }
+ * Optional header: Idempotency-Key: <unique-client-key>
  */
 app.post("/api/revoke", async (req, res) => {
+  let revokeIdempotency: { key: string; fingerprint: string } | null = null;
+  const respondRevoke = (statusCode: number, body: unknown) => {
+    if (revokeIdempotency) {
+      completeRelayIdempotency(
+        revokeIdempotency.key,
+        revokeIdempotency.fingerprint,
+        statusCode,
+        body
+      );
+    }
+    return res.status(statusCode).json(body);
+  };
+
   try {
     if (!requireRelayTxModeEnabled(res)) return;
 
     const auth = await ensureJwtAddressIsAuthorizedIssuer(req, res);
     if (!auth) return;
 
-    const certId = String(req.body?.certId || "").trim();
+    const certId = normalizeCertId(req.body?.certId);
     if (!certId) {
       return res.status(400).json({
         error: "Missing required field",
@@ -2594,10 +3442,32 @@ app.post("/api/revoke", async (req, res) => {
       });
     }
 
+    const idempotencyKey = getRelayIdempotencyKey(req, "revoke");
+    if (idempotencyKey) {
+      const fingerprint = makeRelayIdempotencyFingerprint({
+        operation: "revoke",
+        issuer: auth.address.toLowerCase(),
+        certId,
+      });
+      const idempotencyState = startRelayIdempotency(idempotencyKey, fingerprint);
+      if (idempotencyState.kind === "replay") {
+        return res.status(idempotencyState.statusCode).json(idempotencyState.body);
+      }
+      if (idempotencyState.kind === "conflict") {
+        return res.status(409).json({ error: idempotencyState.message });
+      }
+      revokeIdempotency = { key: idempotencyKey, fingerprint };
+    }
+
     const signer = createRelaySignerOrRespond(res);
-    if (!signer) return;
+    if (!signer) {
+      if (revokeIdempotency) {
+        releaseRelayIdempotency(revokeIdempotency.key, revokeIdempotency.fingerprint);
+      }
+      return;
+    }
     if (signer.address.toLowerCase() !== auth.address.toLowerCase()) {
-      return res.status(403).json({
+      return respondRevoke(403, {
         error: "Authenticated wallet does not match backend issuer signer",
       });
     }
@@ -2609,7 +3479,7 @@ app.post("/api/revoke", async (req, res) => {
     const tx = await revokeCertificate.send(certId);
     const receipt = await tx.wait();
 
-    return res.json({
+    return respondRevoke(200, {
       ok: true,
       certId,
       issuer: signer.address,
@@ -2617,6 +3487,9 @@ app.post("/api/revoke", async (req, res) => {
       blockNumber: receipt?.blockNumber ?? null,
     });
   } catch (err: any) {
+    if (revokeIdempotency) {
+      releaseRelayIdempotency(revokeIdempotency.key, revokeIdempotency.fingerprint);
+    }
     console.error("Revoke failed:", err?.shortMessage || err?.message);
     return res.status(500).json({
       error: "Revoke failed",
@@ -2676,7 +3549,10 @@ app.post("/api/admin/issuer", async (req, res) => {
       blockNumber: receipt?.blockNumber ?? null,
     });
   } catch (err: any) {
-    console.error("Set issuer failed:", err?.shortMessage || err?.message);
+    logEvent("error", "set_issuer_failed", {
+      requestId: getRequestId(req),
+      error: err?.shortMessage || err?.message || String(err),
+    });
     return res.status(500).json({
       error: "Set issuer failed",
       message: err?.shortMessage || err?.message || String(err),
@@ -2686,17 +3562,21 @@ app.post("/api/admin/issuer", async (req, res) => {
 
 const port = Number(process.env.PORT || 5050);
 app.listen(port, () => {
-  console.log(`Backend running on http://localhost:${port}`);
+  logEvent("info", "backend_started", { port });
   ensureCertificateIndexFresh().catch((err: any) => {
-    console.error("Certificate index bootstrap failed:", err?.message || String(err));
+    logEvent("error", "certificate_index_bootstrap_failed", {
+      error: err?.message || String(err),
+    });
   });
   ensureIssuerIndexFresh().catch((err: any) => {
-    console.error("Issuer index bootstrap failed:", err?.message || String(err));
+    logEvent("error", "issuer_index_bootstrap_failed", {
+      error: err?.message || String(err),
+    });
   });
   startCertificateIndexerPolling();
 });
 
-app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+app.use((err: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {
   if (err instanceof multer.MulterError) {
     if (err.code === "LIMIT_FILE_SIZE") {
       return res.status(413).json({ error: "Uploaded file exceeds MAX_UPLOAD_BYTES limit" });
@@ -2711,8 +3591,11 @@ app.use((err: unknown, _req: express.Request, res: express.Response, _next: expr
     if (err.message === "Origin not allowed by CORS") {
       return res.status(403).json({ error: err.message });
     }
-    console.error("Unhandled server error:", err.message);
-    if (err.stack) console.error(err.stack);
+    logEvent("error", "unhandled_server_error", {
+      requestId: getRequestId(req),
+      error: err.message,
+      stack: err.stack || "",
+    });
     return res.status(500).json({ error: "Unhandled server error", message: err.message });
   }
 

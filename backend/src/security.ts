@@ -6,6 +6,27 @@ import jwt from "jsonwebtoken";
 import { Contract, JsonRpcProvider, getAddress, verifyMessage } from "ethers";
 import { z } from "zod";
 
+type LogLevel = "info" | "warn" | "error";
+
+function logEvent(level: LogLevel, message: string, fields?: Record<string, unknown>): void {
+  const payload = {
+    ts: new Date().toISOString(),
+    level,
+    message,
+    ...(fields || {}),
+  };
+  const line = JSON.stringify(payload);
+  if (level === "error") {
+    console.error(line);
+    return;
+  }
+  if (level === "warn") {
+    console.warn(line);
+    return;
+  }
+  console.log(line);
+}
+
 type Role = "MOE_ADMIN" | "INSTITUTION_ADMIN" | "INDIVIDUAL";
 type InstitutionStatus = "PENDING" | "ACTIVE" | "SUSPENDED";
 
@@ -18,13 +39,43 @@ type Institution = { id: string; name: string; status: InstitutionStatus; admin_
 type InstitutionUser = { user_id: string; institution_id: string; is_primary_admin: boolean };
 type WalletBinding = { institution_id: string; wallet_address: string; verified: boolean; verified_at: string | null };
 type RefreshToken = { user_id: string; token_hash: string; expires_at: string; revoked_at: string | null };
+type PasswordResetToken = {
+  id: string;
+  user_id: string;
+  token_hash: string;
+  expires_at: string;
+  used_at: string | null;
+};
 
 const ACCESS_TTL_SEC = Number(process.env.JWT_ACCESS_TTL_SEC || 900);
 const REFRESH_TTL_SEC = Number(process.env.JWT_REFRESH_TTL_SEC || 604800);
 const nonceTtlMs = Number(process.env.AUTH_NONCE_TTL_MS || 5 * 60 * 1000);
+const loginTrackWindowMs = Number(process.env.AUTH_LOGIN_TRACK_WINDOW_MS || 30 * 60 * 1000);
+const loginDelayStartAfterFailures = Number(process.env.AUTH_LOGIN_DELAY_START_AFTER || 2);
+const loginDelayBaseMs = Number(process.env.AUTH_LOGIN_DELAY_BASE_MS || 250);
+const loginDelayMaxMs = Number(process.env.AUTH_LOGIN_DELAY_MAX_MS || 5000);
+const loginLockoutThreshold = Number(process.env.AUTH_LOGIN_LOCKOUT_THRESHOLD || 8);
+const loginLockoutMs = Number(process.env.AUTH_LOGIN_LOCKOUT_MS || 15 * 60 * 1000);
+const emailSendQueueMaxAttempts = Math.max(1, Number(process.env.EMAIL_SEND_QUEUE_MAX_ATTEMPTS || 6));
+const emailSendQueueBaseDelayMs = Math.max(200, Number(process.env.EMAIL_SEND_QUEUE_BASE_DELAY_MS || 1000));
+const emailSendQueueMaxDelayMs = Math.max(emailSendQueueBaseDelayMs, Number(process.env.EMAIL_SEND_QUEUE_MAX_DELAY_MS || 60000));
+const emailSendQueueTickMs = Math.max(250, Number(process.env.EMAIL_SEND_QUEUE_TICK_MS || 2000));
+const passwordResetTtlMs = Math.max(5 * 60 * 1000, Number(process.env.PASSWORD_RESET_TTL_MS || 30 * 60 * 1000));
 
 const CERT_ABI = ["function authorizedIssuers(address issuer) view returns (bool)"];
 const walletNonceByKey = new Map<string, { nonce: string; expiresAt: number }>();
+const failedLoginByEmail = new Map<string, { failCount: number; firstFailedAt: number; lastFailedAt: number; lockedUntil: number }>();
+const emailSendQueue = new Map<
+  string,
+  {
+    input: { to: string; inviteUrl: string; institutionName: string };
+    attempts: number;
+    nextRunAt: number;
+    lastError: string;
+  }
+>();
+let emailSendWorkerStarted = false;
+let emailSendFlushPromise: Promise<void> | null = null;
 
 function accessSecret(): string {
   return (process.env.JWT_ACCESS_SECRET || process.env.JWT_SECRET || "").trim();
@@ -66,31 +117,172 @@ function inviteSubjectPrefix(): string {
   return (process.env.INVITE_EMAIL_SUBJECT_PREFIX || "CertChain").trim();
 }
 
-async function sendInviteEmail(input: { to: string; inviteUrl: string; institutionName: string }): Promise<{ sent: boolean; error?: string }> {
+function passwordResetUrlBase(): string {
+  const raw = String(process.env.PASSWORD_RESET_URL_BASE || "").trim();
+  if (raw) return raw.replace(/\/+$/, "");
+  return `${authUri().replace(/\/+$/, "")}/reset-password`;
+}
+
+function refreshCookieName(): string {
+  return (process.env.AUTH_REFRESH_COOKIE_NAME || "tmc_refresh").trim();
+}
+
+function refreshCookieSecure(): boolean {
+  return String(process.env.AUTH_REFRESH_COOKIE_SECURE || "").trim().toLowerCase() === "true";
+}
+
+function refreshCookieSameSite(): "lax" | "strict" | "none" {
+  const raw = String(process.env.AUTH_REFRESH_COOKIE_SAMESITE || "lax").trim().toLowerCase();
+  if (raw === "strict" || raw === "none") return raw;
+  return "lax";
+}
+
+function refreshCookieDomain(): string | undefined {
+  const d = String(process.env.AUTH_REFRESH_COOKIE_DOMAIN || "").trim();
+  return d || undefined;
+}
+
+function emailQueueKey(input: { to: string; inviteUrl: string; institutionName: string }): string {
+  return `${input.to.toLowerCase()}|${sha256(input.inviteUrl)}|${sha256(input.institutionName.toLowerCase())}`;
+}
+
+async function sendInviteEmailNow(input: { to: string; inviteUrl: string; institutionName: string }): Promise<void> {
   const key = resendApiKey();
   const from = resendFromEmail();
-  if (!key || !from) return { sent: false, error: "RESEND_API_KEY/RESEND_FROM_EMAIL not configured" };
+  if (!key || !from) throw new Error("RESEND_API_KEY/RESEND_FROM_EMAIL not configured");
   const subject = `${inviteSubjectPrefix()} institution invite`;
   const html =
     `<p>You have been invited to administer <strong>${input.institutionName}</strong> on CertChain.</p>` +
     `<p>Open this link to accept your invite and set your password:</p>` +
     `<p><a href="${input.inviteUrl}">${input.inviteUrl}</a></p>` +
     "<p>This invite expires in 7 days.</p>";
-  try {
-    const r = await axios.post(
-      "https://api.resend.com/emails",
-      { from, to: [input.to], subject, html },
-      {
-        headers: {
-          Authorization: `Bearer ${key}`,
-          "Content-Type": "application/json",
-        },
+  await axios.post(
+    "https://api.resend.com/emails",
+    { from, to: [input.to], subject, html },
+    {
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
       },
-    );
-    return { sent: r.status >= 200 && r.status < 300 };
-  } catch (e: any) {
-    return { sent: false, error: e?.response?.data?.message || e?.message || "Resend send failed" };
+    },
+  );
+}
+
+function enqueueInviteEmail(input: { to: string; inviteUrl: string; institutionName: string }, error: string): void {
+  const k = emailQueueKey(input);
+  const existing = emailSendQueue.get(k);
+  emailSendQueue.set(k, {
+    input,
+    attempts: existing?.attempts || 0,
+    nextRunAt: Date.now(),
+    lastError: error,
+  });
+}
+
+async function flushEmailSendQueue(): Promise<void> {
+  if (emailSendFlushPromise) return emailSendFlushPromise;
+  emailSendFlushPromise = (async () => {
+    const now = Date.now();
+    const due = Array.from(emailSendQueue.entries()).filter(([, item]) => item.nextRunAt <= now);
+    for (const [k, item] of due) {
+      try {
+        await sendInviteEmailNow(item.input);
+        emailSendQueue.delete(k);
+        logEvent("info", "invite_email_queue_sent", {
+          to: item.input.to,
+          remaining: emailSendQueue.size,
+        });
+      } catch (e: any) {
+        const attempts = item.attempts + 1;
+        const errMsg = e?.response?.data?.message || e?.message || "Resend send failed";
+        if (attempts >= emailSendQueueMaxAttempts) {
+          emailSendQueue.delete(k);
+          logEvent("error", "invite_email_queue_drop", {
+            to: item.input.to,
+            attempts,
+            error: errMsg,
+          });
+          continue;
+        }
+        const delay = Math.min(
+          emailSendQueueMaxDelayMs,
+          emailSendQueueBaseDelayMs * Math.pow(2, attempts - 1)
+        );
+        emailSendQueue.set(k, {
+          input: item.input,
+          attempts,
+          nextRunAt: Date.now() + delay,
+          lastError: errMsg,
+        });
+        logEvent("warn", "invite_email_queue_retry", {
+          to: item.input.to,
+          attempts,
+          delayMs: delay,
+          error: errMsg,
+        });
+      }
+    }
+  })().finally(() => {
+    emailSendFlushPromise = null;
+  });
+  return emailSendFlushPromise;
+}
+
+function ensureEmailSendWorker(): void {
+  if (emailSendWorkerStarted) return;
+  emailSendWorkerStarted = true;
+  setInterval(() => {
+    void flushEmailSendQueue();
+  }, emailSendQueueTickMs);
+}
+
+async function sendInviteEmail(input: { to: string; inviteUrl: string; institutionName: string }): Promise<{ sent: boolean; error?: string; queued?: boolean }> {
+  ensureEmailSendWorker();
+  let lastError = "";
+  const immediateAttempts = Math.min(3, emailSendQueueMaxAttempts);
+  for (let i = 0; i < immediateAttempts; i += 1) {
+    try {
+      await sendInviteEmailNow(input);
+      return { sent: true };
+    } catch (e: any) {
+      lastError = e?.response?.data?.message || e?.message || "Resend send failed";
+      const delay = Math.min(emailSendQueueMaxDelayMs, emailSendQueueBaseDelayMs * Math.pow(2, i));
+      if (i < immediateAttempts - 1) {
+        await sleep(delay);
+      }
+    }
   }
+  enqueueInviteEmail(input, lastError || "Resend send failed");
+  return { sent: false, queued: true, error: lastError || "Resend send failed (queued for retry)" };
+}
+
+async function sendPasswordResetEmail(input: { to: string; resetUrl: string }): Promise<void> {
+  const key = resendApiKey();
+  const from = resendFromEmail();
+  if (!key || !from) {
+    logEvent("warn", "password_reset_email_skipped", {
+      reason: "RESEND_API_KEY/RESEND_FROM_EMAIL not configured",
+      to: input.to,
+    });
+    return;
+  }
+
+  const subject = `${inviteSubjectPrefix()} password reset`;
+  const html =
+    "<p>We received a request to reset your password on TrustMyCert.</p>" +
+    `<p>Open this link to set a new password:</p><p><a href="${input.resetUrl}">${input.resetUrl}</a></p>` +
+    "<p>This link expires shortly. If you did not request this, you can ignore this email.</p>";
+
+  await axios.post(
+    "https://api.resend.com/emails",
+    { from, to: [input.to], subject, html },
+    {
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
+      },
+    },
+  );
 }
 
 function guardConfig(): void {
@@ -131,12 +323,79 @@ async function audit(input: { actorUserId?: string | null; actorWallet?: string 
       prefer: "return=minimal",
     });
   } catch (e: any) {
-    console.error("audit log failed:", e?.message || String(e));
+    logEvent("error", "audit_log_failed", { error: e?.message || String(e) });
   }
 }
 
 function sha256(v: string): string {
   return crypto.createHash("sha256").update(v, "utf8").digest("hex");
+}
+
+function normalizeCertId(value: unknown): string {
+  return String(value ?? "").trim().toLowerCase();
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getFailedLoginState(email: string): { failCount: number; firstFailedAt: number; lastFailedAt: number; lockedUntil: number } | null {
+  const k = email.trim().toLowerCase();
+  if (!k) return null;
+  const s = failedLoginByEmail.get(k) || null;
+  if (!s) return null;
+  const now = Date.now();
+  if (s.lastFailedAt + loginTrackWindowMs < now && s.lockedUntil <= now) {
+    failedLoginByEmail.delete(k);
+    return null;
+  }
+  return s;
+}
+
+function computeLoginDelayMs(failCount: number): number {
+  if (failCount <= loginDelayStartAfterFailures) return 0;
+  const extraFailures = failCount - loginDelayStartAfterFailures - 1;
+  const raw = loginDelayBaseMs * Math.pow(2, Math.max(0, extraFailures));
+  return Math.min(loginDelayMaxMs, Math.max(0, Math.floor(raw)));
+}
+
+function getLoginThrottle(email: string): { lockedUntil: number; delayMs: number } {
+  const s = getFailedLoginState(email);
+  if (!s) return { lockedUntil: 0, delayMs: 0 };
+  const now = Date.now();
+  if (s.lockedUntil > now) return { lockedUntil: s.lockedUntil, delayMs: 0 };
+  return { lockedUntil: 0, delayMs: computeLoginDelayMs(s.failCount) };
+}
+
+function recordFailedLogin(email: string): { failCount: number; lockedUntil: number } {
+  const k = email.trim().toLowerCase();
+  const now = Date.now();
+  const s = getFailedLoginState(k);
+  const next = s
+    ? {
+        failCount: s.failCount + 1,
+        firstFailedAt: s.firstFailedAt,
+        lastFailedAt: now,
+        lockedUntil: s.lockedUntil,
+      }
+    : {
+        failCount: 1,
+        firstFailedAt: now,
+        lastFailedAt: now,
+        lockedUntil: 0,
+      };
+
+  if (next.failCount >= loginLockoutThreshold) {
+    next.lockedUntil = now + loginLockoutMs;
+  }
+  failedLoginByEmail.set(k, next);
+  return { failCount: next.failCount, lockedUntil: next.lockedUntil };
+}
+
+function clearFailedLogin(email: string): void {
+  const k = email.trim().toLowerCase();
+  if (!k) return;
+  failedLoginByEmail.delete(k);
 }
 
 function normAddr(v: string): string | null {
@@ -150,6 +409,53 @@ function normAddr(v: string): string | null {
 function bearer(req: express.Request): string {
   const a = req.header("authorization") || "";
   return a.startsWith("Bearer ") ? a.slice(7).trim() : "";
+}
+
+function parseCookies(req: express.Request): Record<string, string> {
+  const raw = String(req.header("cookie") || "");
+  if (!raw) return {};
+  const out: Record<string, string> = {};
+  for (const part of raw.split(";")) {
+    const idx = part.indexOf("=");
+    if (idx <= 0) continue;
+    const k = part.slice(0, idx).trim();
+    const v = part.slice(idx + 1).trim();
+    if (!k) continue;
+    try {
+      out[k] = decodeURIComponent(v);
+    } catch {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
+function refreshTokenFromRequest(req: express.Request): string {
+  const bodyToken = String(req.body?.refreshToken || "").trim();
+  if (bodyToken) return bodyToken;
+  const cookies = parseCookies(req);
+  return String(cookies[refreshCookieName()] || "").trim();
+}
+
+function setRefreshCookie(res: express.Response, refreshToken: string): void {
+  res.cookie(refreshCookieName(), refreshToken, {
+    httpOnly: true,
+    secure: refreshCookieSecure(),
+    sameSite: refreshCookieSameSite(),
+    domain: refreshCookieDomain(),
+    path: "/api/auth",
+    maxAge: REFRESH_TTL_SEC * 1000,
+  });
+}
+
+function clearRefreshCookie(res: express.Response): void {
+  res.clearCookie(refreshCookieName(), {
+    httpOnly: true,
+    secure: refreshCookieSecure(),
+    sameSite: refreshCookieSameSite(),
+    domain: refreshCookieDomain(),
+    path: "/api/auth",
+  });
 }
 
 function signToken(payload: { sub: string; role: Role; email: string; tokenType: "access" | "refresh" }): string {
@@ -283,8 +589,14 @@ const zRegister = z.object({
   bootstrapSecret: z.string().min(8).optional(),
 });
 const zLogin = zRegister;
-const zRefresh = z.object({ refreshToken: z.string().min(20) });
+const zRefresh = z.object({ refreshToken: z.string().min(20).optional() });
 const zAcceptInvite = z.object({ token: z.string().min(16), password: z.string().min(8).max(128) });
+const zForgotPassword = z.object({ email: z.string().email().transform((v) => v.toLowerCase()) });
+const zResetPassword = z.object({ token: z.string().min(16), password: z.string().min(8).max(128) });
+const zChangePassword = z.object({
+  currentPassword: z.string().min(8).max(128),
+  newPassword: z.string().min(8).max(128),
+});
 const zCreateInstitution = z.object({ name: z.string().min(2).max(200), adminEmail: z.string().email().transform((v) => v.toLowerCase()), issuerWallet: z.string().min(42).max(42) });
 const zStatus = z.object({ status: z.enum(["ACTIVE", "SUSPENDED"]) });
 const zResend = z.object({ email: z.string().email().transform((v) => v.toLowerCase()).optional() });
@@ -336,7 +648,8 @@ export function registerSecurityRoutes(app: express.Express, authLimiter: expres
       if (!u) return res.status(500).json({ error: "Registration failed" });
       const t = await issueTokens(u);
       await audit({ actorUserId: u.id, action: `AUTH_REGISTER_${u.role}`, entityType: "user", entityId: u.id });
-      return res.status(201).json({ ...t, user: { id: u.id, email: u.email, role: u.role, emailVerified: u.email_verified } });
+      setRefreshCookie(res, t.refreshToken);
+      return res.status(201).json({ accessToken: t.accessToken, user: { id: u.id, email: u.email, role: u.role, emailVerified: u.email_verified } });
     } catch (e: any) {
       return res.status(400).json({ error: "Invalid register payload", details: e?.message || String(e) });
     }
@@ -345,11 +658,31 @@ export function registerSecurityRoutes(app: express.Express, authLimiter: expres
   app.post("/api/auth/login", authLimiter, async (req, res) => {
     try {
       const b = zLogin.parse(req.body || {});
+      const throttle = getLoginThrottle(b.email);
+      if (throttle.lockedUntil > Date.now()) {
+        const retryAfterSec = Math.max(1, Math.ceil((throttle.lockedUntil - Date.now()) / 1000));
+        res.setHeader("Retry-After", String(retryAfterSec));
+        return res.status(429).json({ error: "Too many failed login attempts. Try again later." });
+      }
+      if (throttle.delayMs > 0) {
+        await sleep(throttle.delayMs);
+      }
+
       const u = await userByEmail(b.email);
-      if (!u || !(await bcrypt.compare(b.password, u.password_hash))) return res.status(401).json({ error: "Invalid credentials" });
+      if (!u || !(await bcrypt.compare(b.password, u.password_hash))) {
+        const failure = recordFailedLogin(b.email);
+        if (failure.lockedUntil > Date.now()) {
+          const retryAfterSec = Math.max(1, Math.ceil((failure.lockedUntil - Date.now()) / 1000));
+          res.setHeader("Retry-After", String(retryAfterSec));
+          return res.status(429).json({ error: "Too many failed login attempts. Try again later." });
+        }
+        return res.status(401).json({ error: "Invalid credentials" });
+      }
+      clearFailedLogin(b.email);
       const t = await issueTokens(u);
       await audit({ actorUserId: u.id, action: "AUTH_LOGIN", entityType: "user", entityId: u.id });
-      return res.json({ ...t, user: { id: u.id, email: u.email, role: u.role, emailVerified: u.email_verified } });
+      setRefreshCookie(res, t.refreshToken);
+      return res.json({ accessToken: t.accessToken, user: { id: u.id, email: u.email, role: u.role, emailVerified: u.email_verified } });
     } catch (e: any) {
       return res.status(400).json({ error: "Invalid login payload", details: e?.message || String(e) });
     }
@@ -358,18 +691,22 @@ export function registerSecurityRoutes(app: express.Express, authLimiter: expres
   app.post("/api/auth/refresh", authLimiter, async (req, res) => {
     try {
       const b = zRefresh.parse(req.body || {});
-      const c = verifyToken(b.refreshToken, "refresh");
+      const refreshToken = String(b.refreshToken || refreshTokenFromRequest(req) || "").trim();
+      if (!refreshToken) return res.status(401).json({ error: "Missing refresh token" });
+      const c = verifyToken(refreshToken, "refresh");
       const rows = await db<RefreshToken[]>({
         method: "GET",
         table: "refresh_tokens",
-        params: { select: "*", user_id: `eq.${c.sub}`, token_hash: `eq.${sha256(b.refreshToken)}`, revoked_at: "is.null", limit: "1" },
+        params: { select: "*", user_id: `eq.${c.sub}`, token_hash: `eq.${sha256(refreshToken)}`, revoked_at: "is.null", limit: "1" },
       });
       const rt = rows[0];
       if (!rt || new Date(rt.expires_at).getTime() < Date.now()) return res.status(401).json({ error: "Invalid refresh token" });
-      await db({ method: "PATCH", table: "refresh_tokens", params: { user_id: `eq.${c.sub}`, token_hash: `eq.${sha256(b.refreshToken)}` }, body: { revoked_at: new Date().toISOString() }, prefer: "return=minimal" });
+      await db({ method: "PATCH", table: "refresh_tokens", params: { user_id: `eq.${c.sub}`, token_hash: `eq.${sha256(refreshToken)}` }, body: { revoked_at: new Date().toISOString() }, prefer: "return=minimal" });
       const u = await userById(c.sub);
       if (!u) return res.status(401).json({ error: "User not found" });
-      return res.json(await issueTokens(u));
+      const t = await issueTokens(u);
+      setRefreshCookie(res, t.refreshToken);
+      return res.json({ accessToken: t.accessToken });
     } catch {
       return res.status(401).json({ error: "Invalid refresh token" });
     }
@@ -378,10 +715,129 @@ export function registerSecurityRoutes(app: express.Express, authLimiter: expres
   app.post("/api/auth/logout", authLimiter, async (req, res) => {
     try {
       const b = zRefresh.parse(req.body || {});
-      await db({ method: "PATCH", table: "refresh_tokens", params: { token_hash: `eq.${sha256(b.refreshToken)}`, revoked_at: "is.null" }, body: { revoked_at: new Date().toISOString() }, prefer: "return=minimal" });
+      const refreshToken = String(b.refreshToken || refreshTokenFromRequest(req) || "").trim();
+      if (refreshToken) {
+        await db({ method: "PATCH", table: "refresh_tokens", params: { token_hash: `eq.${sha256(refreshToken)}`, revoked_at: "is.null" }, body: { revoked_at: new Date().toISOString() }, prefer: "return=minimal" });
+      }
+      clearRefreshCookie(res);
       return res.json({ ok: true });
     } catch (e: any) {
       return res.status(400).json({ error: "Invalid logout payload", details: e?.message || String(e) });
+    }
+  });
+
+  app.post("/api/auth/forgot-password", authLimiter, async (req, res) => {
+    try {
+      const b = zForgotPassword.parse(req.body || {});
+      const u = await userByEmail(b.email);
+      if (u) {
+        await db({
+          method: "PATCH",
+          table: "password_reset_tokens",
+          params: { user_id: `eq.${u.id}`, used_at: "is.null" },
+          body: { used_at: new Date().toISOString() },
+          prefer: "return=minimal",
+        });
+        const token = crypto.randomBytes(24).toString("hex");
+        const expiresAt = new Date(Date.now() + passwordResetTtlMs).toISOString();
+        await db({
+          method: "POST",
+          table: "password_reset_tokens",
+          body: [{ user_id: u.id, token_hash: sha256(token), expires_at: expiresAt }],
+          prefer: "return=minimal",
+        });
+        const resetUrl = `${passwordResetUrlBase()}?token=${encodeURIComponent(token)}`;
+        try {
+          await sendPasswordResetEmail({ to: u.email, resetUrl });
+        } catch (e: any) {
+          logEvent("error", "password_reset_email_failed", {
+            userId: u.id,
+            email: u.email,
+            error: e?.response?.data?.message || e?.message || String(e),
+          });
+        }
+        await audit({ actorUserId: u.id, action: "AUTH_FORGOT_PASSWORD_REQUESTED", entityType: "user", entityId: u.id });
+      }
+      return res.json({ ok: true, message: "If an account exists for that email, a reset link has been sent." });
+    } catch (e: any) {
+      return res.status(400).json({ error: "Invalid forgot password payload", details: e?.message || String(e) });
+    }
+  });
+
+  app.post("/api/auth/reset-password", authLimiter, async (req, res) => {
+    try {
+      const b = zResetPassword.parse(req.body || {});
+      const tokenHash = sha256(b.token);
+      const rows = await db<PasswordResetToken[]>({
+        method: "GET",
+        table: "password_reset_tokens",
+        params: { select: "*", token_hash: `eq.${tokenHash}`, limit: "1" },
+      });
+      const row = rows[0];
+      if (!row || row.used_at || new Date(row.expires_at).getTime() < Date.now()) {
+        return res.status(400).json({ error: "Invalid or expired reset token" });
+      }
+      const u = await userById(row.user_id);
+      if (!u) return res.status(400).json({ error: "Invalid or expired reset token" });
+      const nextHash = await bcrypt.hash(b.password, 12);
+      await db({
+        method: "PATCH",
+        table: "users",
+        params: { id: `eq.${u.id}` },
+        body: { password_hash: nextHash },
+        prefer: "return=minimal",
+      });
+      await db({
+        method: "PATCH",
+        table: "password_reset_tokens",
+        params: { id: `eq.${row.id}` },
+        body: { used_at: new Date().toISOString() },
+        prefer: "return=minimal",
+      });
+      await db({
+        method: "PATCH",
+        table: "refresh_tokens",
+        params: { user_id: `eq.${u.id}`, revoked_at: "is.null" },
+        body: { revoked_at: new Date().toISOString() },
+        prefer: "return=minimal",
+      });
+      clearFailedLogin(u.email);
+      await audit({ actorUserId: u.id, action: "AUTH_PASSWORD_RESET", entityType: "user", entityId: u.id });
+      return res.json({ ok: true });
+    } catch (e: any) {
+      return res.status(400).json({ error: "Invalid reset password payload", details: e?.message || String(e) });
+    }
+  });
+
+  app.post("/api/auth/change-password", authLimiter, auth, async (req: AuthReq, res) => {
+    try {
+      const b = zChangePassword.parse(req.body || {});
+      if (b.currentPassword === b.newPassword) {
+        return res.status(400).json({ error: "New password must be different from current password" });
+      }
+      const u = await userById(req.auth!.userId);
+      if (!u) return res.status(401).json({ error: "User not found" });
+      const valid = await bcrypt.compare(b.currentPassword, u.password_hash);
+      if (!valid) return res.status(401).json({ error: "Current password is incorrect" });
+      const nextHash = await bcrypt.hash(b.newPassword, 12);
+      await db({
+        method: "PATCH",
+        table: "users",
+        params: { id: `eq.${u.id}` },
+        body: { password_hash: nextHash },
+        prefer: "return=minimal",
+      });
+      await db({
+        method: "PATCH",
+        table: "password_reset_tokens",
+        params: { user_id: `eq.${u.id}`, used_at: "is.null" },
+        body: { used_at: new Date().toISOString() },
+        prefer: "return=minimal",
+      });
+      await audit({ actorUserId: u.id, action: "AUTH_PASSWORD_CHANGED", entityType: "user", entityId: u.id });
+      return res.json({ ok: true });
+    } catch (e: any) {
+      return res.status(400).json({ error: "Invalid change password payload", details: e?.message || String(e) });
     }
   });
 
@@ -429,7 +885,9 @@ export function registerSecurityRoutes(app: express.Express, authLimiter: expres
       await db({ method: "POST", table: "institution_users", body: [{ user_id: u.id, institution_id: inv.institution_id, is_primary_admin: true }], prefer: "resolution=ignore-duplicates,return=minimal" });
       await db({ method: "PATCH", table: "invitations", params: { id: `eq.${inv.id}` }, body: { used_at: new Date().toISOString() }, prefer: "return=minimal" });
       await audit({ actorUserId: u.id, action: "INSTITUTION_INVITE_ACCEPTED", entityType: "institution", entityId: inv.institution_id });
-      return res.json({ ok: true, ...(await issueTokens(u)) });
+      const t = await issueTokens(u);
+      setRefreshCookie(res, t.refreshToken);
+      return res.json({ ok: true, accessToken: t.accessToken });
     } catch (e: any) {
       return res.status(400).json({ error: "Invalid invite payload", details: e?.message || String(e) });
     }
@@ -448,7 +906,7 @@ export function registerSecurityRoutes(app: express.Express, authLimiter: expres
       const inviteUrl = `${authUri().replace(/\/+$/, "")}/invite?token=${token}`;
       const mail = await sendInviteEmail({ to: b.adminEmail, inviteUrl, institutionName: inst.name });
       await audit({ actorUserId: req.auth!.userId, action: "MOE_INSTITUTION_CREATED", entityType: "institution", entityId: inst.id, metadata: { issuerWallet: inst.issuer_wallet, adminEmail: inst.admin_email } });
-      return res.status(201).json({ institution: inst, inviteToken: token, inviteUrl, emailSent: mail.sent, emailError: mail.error || null });
+      return res.status(201).json({ institution: inst, inviteToken: token, inviteUrl, emailSent: mail.sent, emailQueued: Boolean(mail.queued), emailError: mail.error || null });
     } catch (e: any) {
       return res.status(400).json({ error: "Invalid institution payload", details: e?.message || String(e) });
     }
@@ -498,7 +956,7 @@ export function registerSecurityRoutes(app: express.Express, authLimiter: expres
       const inviteUrl = `${authUri().replace(/\/+$/, "")}/invite?token=${token}`;
       const mail = await sendInviteEmail({ to: email, inviteUrl, institutionName: inst.name });
       await audit({ actorUserId: req.auth!.userId, action: "MOE_INSTITUTION_INVITE_RESENT", entityType: "institution", entityId: inst.id, metadata: { email } });
-      return res.json({ ok: true, inviteToken: token, inviteUrl, emailSent: mail.sent, emailError: mail.error || null });
+      return res.json({ ok: true, inviteToken: token, inviteUrl, emailSent: mail.sent, emailQueued: Boolean(mail.queued), emailError: mail.error || null });
     } catch (e: any) {
       return res.status(400).json({ error: "Invalid resend payload", details: e?.message || String(e) });
     }
@@ -557,20 +1015,20 @@ export function registerSecurityRoutes(app: express.Express, authLimiter: expres
   app.post("/api/certificates/issue", auth, roles("INSTITUTION_ADMIN"), async (req: AuthReq, res) => {
     const gate = await gateInstitutionAction(req, res);
     if (!gate) {
-      await audit({ actorUserId: req.auth?.userId || null, actorWallet: String(req.body?.connectedWallet || "").toLowerCase() || null, action: "CERT_ISSUE_ATTEMPT_FAILED", entityType: "certificate", entityId: String(req.body?.certId || ""), metadata: { reason: "GATE_CHECK_FAILED" } });
+      await audit({ actorUserId: req.auth?.userId || null, actorWallet: String(req.body?.connectedWallet || "").toLowerCase() || null, action: "CERT_ISSUE_ATTEMPT_FAILED", entityType: "certificate", entityId: normalizeCertId(req.body?.certId), metadata: { reason: "GATE_CHECK_FAILED" } });
       return;
     }
-    await audit({ actorUserId: gate.user.id, actorWallet: gate.wallet, action: "CERT_ISSUE_ATTEMPT_ALLOWED", entityType: "certificate", entityId: String(req.body?.certId || ""), metadata: { txHash: String(req.body?.txHash || "") || null, metadataCid: String(req.body?.metadataCid || "") || null, fileCid: String(req.body?.fileCid || "") || null } });
+    await audit({ actorUserId: gate.user.id, actorWallet: gate.wallet, action: "CERT_ISSUE_ATTEMPT_ALLOWED", entityType: "certificate", entityId: normalizeCertId(req.body?.certId), metadata: { txHash: String(req.body?.txHash || "") || null, metadataCid: String(req.body?.metadataCid || "") || null, fileCid: String(req.body?.fileCid || "") || null } });
     return res.json({ ok: true, allowed: true, mode: "wallet-native", message: "Authorized. Submit issue tx via MetaMask." });
   });
 
   app.post("/api/certificates/revoke", auth, roles("INSTITUTION_ADMIN"), async (req: AuthReq, res) => {
     const gate = await gateInstitutionAction(req, res);
     if (!gate) {
-      await audit({ actorUserId: req.auth?.userId || null, actorWallet: String(req.body?.connectedWallet || "").toLowerCase() || null, action: "CERT_REVOKE_ATTEMPT_FAILED", entityType: "certificate", entityId: String(req.body?.certId || ""), metadata: { reason: "GATE_CHECK_FAILED" } });
+      await audit({ actorUserId: req.auth?.userId || null, actorWallet: String(req.body?.connectedWallet || "").toLowerCase() || null, action: "CERT_REVOKE_ATTEMPT_FAILED", entityType: "certificate", entityId: normalizeCertId(req.body?.certId), metadata: { reason: "GATE_CHECK_FAILED" } });
       return;
     }
-    await audit({ actorUserId: gate.user.id, actorWallet: gate.wallet, action: "CERT_REVOKE_ATTEMPT_ALLOWED", entityType: "certificate", entityId: String(req.body?.certId || ""), metadata: { txHash: String(req.body?.txHash || "") || null } });
+    await audit({ actorUserId: gate.user.id, actorWallet: gate.wallet, action: "CERT_REVOKE_ATTEMPT_ALLOWED", entityType: "certificate", entityId: normalizeCertId(req.body?.certId), metadata: { txHash: String(req.body?.txHash || "") || null } });
     return res.json({ ok: true, allowed: true, mode: "wallet-native", message: "Authorized. Submit revoke tx via MetaMask." });
   });
 }

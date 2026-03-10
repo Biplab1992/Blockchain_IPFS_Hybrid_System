@@ -5,7 +5,13 @@
   "main": "index.js",
   "scripts": {
     "dev": "tsx watch ./src/server.ts",
-    "test:auth-smoke": "tsx ./test/auth-routes.smoke.ts"
+    "build": "npm run typecheck",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "npm run typecheck",
+    "test": "npm run test:auth-smoke && npm run test:authz-regression",
+    "test:auth-smoke": "tsx ./test/auth-routes.smoke.ts",
+    "test:authz-regression": "tsx ./test/authz-regression.smoke.ts",
+    "test:e2e-full": "tsx ./test/e2e-full-flow.ts"
   },
   "keywords": [],
   "author": "",

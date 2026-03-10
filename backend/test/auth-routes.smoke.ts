@@ -1,6 +1,6 @@
 import assert from "assert";
 
-const API = process.env.TEST_API_BASE || "http://localhost:5050";
+const API = String(process.env.TEST_API_BASE || "").trim();
 
 async function req(path: string, init?: RequestInit): Promise<{ status: number; body: any }> {
   const r = await fetch(`${API}${path}`, init);
@@ -15,6 +15,11 @@ async function req(path: string, init?: RequestInit): Promise<{ status: number; 
 }
 
 async function main() {
+  if (!API) {
+    console.log("Skipping auth smoke checks (TEST_API_BASE is not set).");
+    return;
+  }
+
   const email = `smoke_${Date.now()}@example.com`;
   const password = "SmokePass123!";
 
@@ -58,4 +63,3 @@ main().catch((err) => {
   console.error("Auth smoke checks failed:", err?.message || String(err));
   process.exit(1);
 });
-
