@@ -2,7 +2,7 @@ import assert from "assert";
 import axios from "axios";
 import FormData from "form-data";
 import { Contract, JsonRpcProvider, Wallet } from "ethers";
-import crypto from "crypto";
+import { PDFDocument, StandardFonts } from "pdf-lib";
 
 const API = String(process.env.TEST_API_BASE || "").trim();
 const RPC_URL = String(process.env.TEST_RPC_URL || process.env.RPC_URL || "").trim();
@@ -32,8 +32,14 @@ async function req(path: string, init?: RequestInit): Promise<{ status: number; 
   return { status: r.status, body };
 }
 
-function sha256Hex(buffer: Buffer): string {
-  return crypto.createHash("sha256").update(buffer).digest("hex");
+async function createPdfBytes(title: string, body: string): Promise<Buffer> {
+  const pdf = await PDFDocument.create();
+  const page = pdf.addPage([595, 842]);
+  const titleFont = await pdf.embedFont(StandardFonts.HelveticaBold);
+  const bodyFont = await pdf.embedFont(StandardFonts.Helvetica);
+  page.drawText(title, { x: 40, y: 780, size: 20, font: titleFont });
+  page.drawText(body, { x: 40, y: 740, size: 12, font: bodyFont });
+  return Buffer.from(await pdf.save());
 }
 
 async function waitFor<T>(fn: () => Promise<T>, ok: (value: T) => boolean, attempts = 15, delayMs = 1200): Promise<T> {
@@ -81,9 +87,18 @@ async function ensureMoeToken(): Promise<string> {
   return String(reg.body.accessToken || "");
 }
 
-async function pinFile(buffer: Buffer, filename: string, token: string, connectedWallet: string): Promise<{ cid: string }> {
+async function pinFile(
+  buffer: Buffer,
+  filename: string,
+  token: string,
+  connectedWallet: string,
+  fields: Record<string, string>
+): Promise<{ metadataCid: string; fileCid: string; fileHash: string }> {
   const fd = new FormData();
   fd.append("file", buffer, { filename });
+  for (const [key, value] of Object.entries(fields)) {
+    fd.append(key, value);
+  }
   const resp = await axios.post(`${API}/api/pin`, fd, {
     headers: {
       ...fd.getHeaders(),
@@ -96,13 +111,12 @@ async function pinFile(buffer: Buffer, filename: string, token: string, connecte
   if (resp.status < 200 || resp.status >= 300) {
     throw new Error(`pin failed (${resp.status}): ${JSON.stringify(resp.data)}`);
   }
-  return resp.data as { cid: string };
+  return resp.data as { metadataCid: string; fileCid: string; fileHash: string };
 }
 
 async function main() {
   if (!API) {
-    console.log("Skipping full e2e flow (TEST_API_BASE is not set).");
-    return;
+    throw new Error("TEST_API_BASE is required for backend e2e flow.");
   }
 
   const institutionAdminPassword = "InstitutionE2ePass123!";
@@ -220,31 +234,24 @@ async function main() {
   assert.equal(preflightIssue.status, 200, `issue preflight failed: ${preflightIssue.status} ${JSON.stringify(preflightIssue.body)}`);
 
   const certId = `e2e-cert-${Date.now()}`.toLowerCase();
-  const fileBytes = Buffer.from(`e2e-file-${Date.now()}`, "utf8");
-  const fileHash = `0x${sha256Hex(fileBytes)}`;
-
-  const pinnedFile = await pinFile(fileBytes, `${certId}.bin`, institutionToken, issuerWallet.address.toLowerCase());
-  const metadata = {
+  const fileBytes = await createPdfBytes(
+    "E2E Certificate",
+    `Issued for ${institutionAdminEmail} at ${new Date().toISOString()}`
+  );
+  const pinned = await pinFile(fileBytes, `${certId}.pdf`, institutionToken, issuerWallet.address.toLowerCase(), {
     certId,
     title: "E2E Certificate",
+    recipient: institutionAdminEmail,
     institutionName: String(profile.body?.institution?.name || "E2E Institute"),
-    fileCid: pinnedFile.cid,
-    fileHash,
-    version: 1,
+    version: "1",
     replacesCertId: "",
-  };
-  const pinnedMetadata = await pinFile(
-    Buffer.from(JSON.stringify(metadata), "utf8"),
-    `${certId}.metadata.json`,
-    institutionToken,
-    issuerWallet.address.toLowerCase()
-  );
+  });
 
   const issuerSigner = new Wallet(issuerWallet.privateKey, provider);
   const issuerContract = new Contract(REGISTRY_ADDRESS, REGISTRY_ABI, issuerSigner);
   const issueTx = await issuerContract
     .getFunction("issueCertificate")
-    .send(certId, pinnedMetadata.cid, pinnedFile.cid, fileHash, 1, "");
+    .send(certId, pinned.metadataCid, pinned.fileCid, pinned.fileHash as `0x${string}`, 1, "");
   await issueTx.wait();
 
   const verifyResp = await waitFor(
@@ -255,6 +262,7 @@ async function main() {
   );
   assert.equal(verifyResp.status, 200, `verify failed: ${verifyResp.status} ${JSON.stringify(verifyResp.body)}`);
   assert.equal(String(verifyResp.body?.status || ""), "VALID", `expected VALID, got ${JSON.stringify(verifyResp.body)}`);
+  assert.equal(String(verifyResp.body?.storageMode || ""), "encrypted-blob", `expected encrypted-blob, got ${JSON.stringify(verifyResp.body)}`);
 
   console.log("Full e2e flow passed (auth + invite + wallet bind + issue + verify).");
 }
@@ -263,4 +271,3 @@ main().catch((err) => {
   console.error("Full e2e flow failed:", err?.message || String(err));
   process.exit(1);
 });
-

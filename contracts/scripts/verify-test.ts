@@ -1,11 +1,6 @@
 import { network } from "hardhat";
 import { loadDeployment } from "./utils/deployments";
 import axios from "axios";
-import crypto from "crypto";
-
-function sha256Hex(buf: Buffer) {
-  return "0x" + crypto.createHash("sha256").update(buf).digest("hex");
-}
 
 async function main() {
   const { ethers, networkName } = await network.connect();
@@ -48,27 +43,22 @@ async function main() {
     return;
   }
 
-  const metadataUrl = `http://localhost:5050/api/fetch/${metadataCid}`;
-  const metadataResp = await axios.get(metadataUrl, { responseType: "arraybuffer" });
-  const metadataJson = JSON.parse(Buffer.from(metadataResp.data).toString("utf8")) as {
-    fileCid?: string;
+  const verifyResp = await axios.get(`http://localhost:5050/api/verify/${encodeURIComponent(certId)}`);
+  const verify = verifyResp.data as {
+    status: string;
+    onChainHash: string;
+    computedHash: string;
+    integrityMatch: boolean;
+    storageMode?: string;
+    encryptionAlg?: string;
   };
 
-  const fileCid = metadataJson.fileCid || fileCidOnChain;
-  if (!fileCid) {
-    throw new Error("No fileCid found in metadata or on-chain record");
-  }
+  console.log("storage  :", verify.storageMode || "unknown");
+  console.log("alg      :", verify.encryptionAlg || "unknown");
+  console.log("On-chain hash :", verify.onChainHash);
+  console.log("Computed hash:", verify.computedHash);
 
-  const fileUrl = `http://localhost:5050/api/fetch/${fileCid}`;
-  const fileResp = await axios.get(fileUrl, { responseType: "arraybuffer" });
-  const fileBuf = Buffer.from(fileResp.data);
-
-  const computedHash = sha256Hex(fileBuf);
-
-  console.log("On-chain hash :", onChainHash);
-  console.log("Computed hash:", computedHash);
-
-  if (computedHash.toLowerCase() === onChainHash.toLowerCase()) {
+  if (verify.integrityMatch && String(verify.status).toUpperCase() === "VALID") {
     console.log("CERTIFICATE IS VALID");
   } else {
     console.log("CERTIFICATE IS INVALID / TAMPERED");

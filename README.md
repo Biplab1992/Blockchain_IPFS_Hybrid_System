@@ -4,7 +4,7 @@ A decentralized certificate registry where the file and metadata are stored on I
 The frontend issues/revokes certificates with the user wallet (MetaMask), while the backend handles pinning, verification APIs, and certificate indexing.
 
 This gives a hybrid model:
-- Off-chain: PDF + metadata JSON on IPFS
+- Off-chain: encrypted certificate blob + minimal metadata JSON on IPFS
 - On-chain: certificate ID, metadata CID, file CID, file hash, issuer, version/replacement status, revocation status
 
 ## Architecture
@@ -25,7 +25,7 @@ Backend (Express/TS: backend/)  ---> Ethereum (CertificateRegistry)
 IPFS (Pinata + gateways)
 
 Verification flow:
-certId -> backend reads chain -> fetches metadata/file from IPFS -> recomputes hash -> VALID/REVOKED/TAMPERED
+certId -> backend reads chain -> fetches metadata/encrypted blob from IPFS -> recomputes hash -> VALID/REVOKED/TAMPERED
 ```
 
 ## Prerequisites
@@ -43,6 +43,18 @@ certId -> backend reads chain -> fetches metadata/file from IPFS -> recomputes h
 - `backend/`: Express API (pinning, verify API, indexer, optional relay mode)
 - `contracts/`: Solidity contract + deploy scripts + Hardhat tests
 
+## Module Boundaries
+
+Recent refactoring splits the most reusable cross-cutting concerns into dedicated modules instead of keeping them inside the main entry files:
+
+- Frontend shared helpers: [`app/src/lib/app-core.js`](app/src/lib/app-core.js)
+- Frontend public verification/institution pages: [`app/src/pages/PublicPages.jsx`](app/src/pages/PublicPages.jsx)
+- Frontend shell and authenticated route composition: [`app/src/App.jsx`](app/src/App.jsx)
+- Backend request logging/origin helpers: [`backend/src/server-observability.ts`](backend/src/server-observability.ts)
+- Backend IPFS hashing/fetch/pin client: [`backend/src/ipfs-client.ts`](backend/src/ipfs-client.ts)
+- Backend PDF verification metadata embedding: [`backend/src/pdf-verification.ts`](backend/src/pdf-verification.ts)
+- Backend route wiring, indexers, and relay flows: [`backend/src/server.ts`](backend/src/server.ts)
+
 ## Environment Setup
 
 Copy templates and fill values:
@@ -54,7 +66,7 @@ copy contracts\.env.example contracts\.env
 ```
 
 Minimum important variables:
-- `backend/.env`: `PINATA_JWT`, `JWT_SECRET`, `RPC_URL`, `CONTRACT_NETWORK_NAME`, `PUBLIC_VERIFY_BASE_URL`
+- `backend/.env`: `PINATA_JWT`, `FILE_ENCRYPTION_KEY`, `JWT_SECRET`, `RPC_URL`, `CONTRACT_NETWORK_NAME`, `PUBLIC_VERIFY_BASE_URL`
 - `contracts/.env`: `DEPLOYER_PRIVATE_KEY` (for deploy scripts using raw signer)
 - `app/.env`: `VITE_API_BASE_URL`, `VITE_CONTRACT_ADDRESS`, `VITE_CHAIN_ID`, `VITE_RPC_URL`
 
@@ -82,6 +94,10 @@ If using Supabase indexer, also set:
 - `PINATA_JWT`:
   - Create a scoped API key in Pinata dashboard and use its JWT token.
   - Keep this server-side only (`backend/.env`), never expose in frontend.
+- `FILE_ENCRYPTION_KEY`:
+  - Generate 32 random bytes and store them as hex or base64 in `backend/.env`.
+  - Example (PowerShell): `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
+  - Treat this as a secret. If it changes, previously pinned encrypted files cannot be decrypted with the new key.
 - `JWT_SECRET`:
   - Generate a long random secret for backend auth token signing.
   - Example (PowerShell): `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
@@ -161,16 +177,29 @@ Notes:
 ## Run Tests
 
 ```bash
-cd contracts
 npm test
 ```
 
-Current test suite covers:
+Default local validation covers:
 - owner-only issuer management
+- backend file-envelope encryption/unit checks
+- frontend verify-page UI test coverage
+- frontend production-build smoke check
 - authorized issuer issuance rules
 - revoke permission boundaries + double revoke prevention
 - replacement/version rules including same-issuer enforcement
 - event emission correctness
+
+Environment-dependent backend integration checks are separate:
+
+```bash
+npm run test:integration
+```
+
+Notes:
+- `npm run test:integration` requires `TEST_API_BASE` and supporting backend test env to be configured.
+- `npm --prefix backend run test:e2e-full` exercises the authenticated backend flow and, when `TEST_FULL_CHAIN_E2E=1`, the on-chain issue/verify path using PDF uploads.
+- `npm --prefix app run test:ui` runs the Vitest/RTL frontend tests directly.
 
 ## Supabase Issuer Index
 
@@ -234,14 +263,14 @@ Security notes:
 2. Connect MetaMask and switch to configured chain.
 3. Upload PDF.
 4. Frontend calls `POST /api/pin`.
-5. Backend pins file + metadata to IPFS and returns:
+5. Backend encrypts the processed PDF, pins the encrypted blob + minimal metadata to IPFS, and returns:
    - `fileCid`
    - `metadataCid`
-   - `fileHash` (sha256)
+   - `fileHash` (sha256 of the encrypted blob)
 6. Frontend wallet calls `issueCertificate(certId, metadataCid, fileCid, fileHash, version, replacesCertId)`.
 7. Contract stores on-chain certificate anchor.
 8. Open `/verify`, enter `certId`.
-9. Backend reads on-chain record, fetches metadata/file from IPFS, recomputes hash, and returns `VALID`, `REVOKED`, or `TAMPERED`.
+9. Backend reads on-chain record, fetches metadata/encrypted blob from IPFS, recomputes the encrypted blob hash, and returns `VALID`, `REVOKED`, or `TAMPERED`.
 
 ## Notes
 

@@ -5,47 +5,43 @@ import multer from "multer";
 import dotenv from "dotenv";
 import axios from "axios";
 import crypto from "crypto";
-import FormData from "form-data";
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import fs from "fs";
-import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
 import jwt from "jsonwebtoken";
 import { Contract, JsonRpcProvider, Wallet, getAddress, verifyMessage, type EventLog } from "ethers";
+import {
+  buildPublicPinnedMetadata,
+  decodeFileEncryptionKey,
+  encryptPinnedFileWithKey,
+  type EncryptedBlobSummary,
+  type PublicPinnedMetadata,
+} from "./file-envelope.js";
+import {
+  GatewayFetchError,
+  fetchCidBytes,
+  fetchCidJson,
+  pinBufferToIpfs,
+  pinJsonToIpfs,
+  sha256Hex,
+  sha256Hex0x,
+} from "./ipfs-client.js";
+import { embedVerificationMetadataInPdf } from "./pdf-verification.js";
 import { institutionPinGuard, registerSecurityRoutes } from "./security.js";
+import {
+  createRequestLoggingMiddleware,
+  getPreferredLanIpv4,
+  getRequestId,
+  isLocalDevOrigin,
+  logEvent,
+} from "./server-observability.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 dotenv.config({ path: path.resolve(__dirname, "..", ".env") });
-
-type LogLevel = "info" | "warn" | "error";
-
-function logEvent(level: LogLevel, message: string, fields?: Record<string, unknown>): void {
-  const payload = {
-    ts: new Date().toISOString(),
-    level,
-    message,
-    ...(fields || {}),
-  };
-  const line = JSON.stringify(payload);
-  if (level === "error") {
-    console.error(line);
-    return;
-  }
-  if (level === "warn") {
-    console.warn(line);
-    return;
-  }
-  console.log(line);
-}
-
-function getRequestId(req: express.Request): string {
-  const existing = String((req as any).requestId || "").trim();
-  return existing || "unknown";
-}
 
 // Safe JWT fingerprint (helps confirm backend loaded the right .env)
 const loadedJwt = process.env.PINATA_JWT || "";
@@ -66,63 +62,8 @@ if (isProduction && corsOrigins.length === 0) {
   throw new Error("CORS_ORIGINS must be set in production");
 }
 
-function isLocalDevOrigin(origin: string): boolean {
-  try {
-    const parsed = new URL(origin);
-    if (!["http:", "https:"].includes(parsed.protocol)) return false;
-    if (parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1" || parsed.hostname === "::1") {
-      return true;
-    }
-
-    const isPrivateIpv4 =
-      /^10\./.test(parsed.hostname) ||
-      /^192\.168\./.test(parsed.hostname) ||
-      /^172\.(1[6-9]|2\d|3[0-1])\./.test(parsed.hostname);
-    return isPrivateIpv4;
-  } catch {
-    return false;
-  }
-}
-
-function getPreferredLanIpv4(): string | null {
-  const nets = os.networkInterfaces();
-  for (const entries of Object.values(nets)) {
-    for (const net of entries || []) {
-      if (net.family !== "IPv4" || net.internal) continue;
-      if (/^10\./.test(net.address) || /^192\.168\./.test(net.address) || /^172\.(1[6-9]|2\d|3[0-1])\./.test(net.address)) {
-        return net.address;
-      }
-    }
-  }
-  return null;
-}
-
 app.disable("x-powered-by");
-app.use((req, res, next) => {
-  const inboundRequestId = String(req.header("x-request-id") || "").trim();
-  const requestId = inboundRequestId || crypto.randomUUID();
-  const startedAtMs = Date.now();
-  (req as any).requestId = requestId;
-  res.setHeader("x-request-id", requestId);
-
-  logEvent("info", "http_request_start", {
-    requestId,
-    method: req.method,
-    path: req.originalUrl || req.url,
-    ip: req.ip,
-  });
-
-  res.on("finish", () => {
-    logEvent("info", "http_request_finish", {
-      requestId,
-      method: req.method,
-      path: req.originalUrl || req.url,
-      statusCode: res.statusCode,
-      durationMs: Date.now() - startedAtMs,
-    });
-  });
-  next();
-});
+app.use(createRequestLoggingMiddleware());
 app.use(
   helmet({
     contentSecurityPolicy: {
@@ -198,53 +139,16 @@ const upload = multer({
 
 registerSecurityRoutes(app, authRateLimiter);
 
-function sha256Hex(buffer: Buffer) {
-  return crypto.createHash("sha256").update(buffer).digest("hex");
+function loadFileEncryptionConfig(): { key: Buffer; keyId: string } {
+  return {
+    key: decodeFileEncryptionKey(String(process.env.FILE_ENCRYPTION_KEY || "")),
+    keyId: String(process.env.FILE_ENCRYPTION_KEY_ID || "default").trim() || "default",
+  };
 }
 
-function sha256Hex0x(buffer: Buffer) {
-  return `0x${sha256Hex(buffer)}`;
-}
-
-type EmbeddedPdfMetadata = {
-  certId: string;
-  title: string;
-  recipient: string;
-  institutionName: string;
-  version: number;
-  replacesCertId: string;
-  verificationUrl: string;
-  sourceHash: string;
-  embeddedAtIso: string;
-};
-
-async function embedVerificationMetadataInPdf(input: Buffer, metadata: EmbeddedPdfMetadata): Promise<Buffer> {
-  const pdf = await PDFDocument.load(input, {
-    ignoreEncryption: true,
-    updateMetadata: true,
-  });
-
-  const subject = `CertChain Verification | certId=${metadata.certId || "N/A"}`;
-  const keywords = [
-    `certId:${metadata.certId || ""}`,
-    `recipient:${metadata.recipient || ""}`,
-    `institution:${metadata.institutionName || ""}`,
-    `version:${metadata.version}`,
-    `replaces:${metadata.replacesCertId || ""}`,
-    `verify:${metadata.verificationUrl}`,
-    `sourceHash:${metadata.sourceHash}`,
-  ].filter(Boolean);
-
-  if (metadata.title) pdf.setTitle(metadata.title);
-  if (metadata.recipient) pdf.setAuthor(metadata.recipient);
-  pdf.setSubject(subject);
-  pdf.setProducer("CertChain Backend");
-  pdf.setCreator("CertChain Verification Pipeline");
-  pdf.setCreationDate(new Date(metadata.embeddedAtIso));
-  pdf.setModificationDate(new Date(metadata.embeddedAtIso));
-  pdf.setKeywords(keywords);
-
-  return Buffer.from(await pdf.save());
+function encryptPinnedFile(buffer: Buffer): { encryptedBytes: Buffer; summary: EncryptedBlobSummary } {
+  const { key, keyId } = loadFileEncryptionConfig();
+  return encryptPinnedFileWithKey(buffer, key, keyId);
 }
 
 const workspaceRoot = path.resolve(__dirname, "..", "..");
@@ -443,44 +347,6 @@ type IssuerEventRow = {
   created_at?: string | null;
 };
 
-class GatewayFetchError extends Error {
-  attempts: Array<{
-    gateway: string;
-    attempt: number;
-    status: number | null;
-    message: string;
-  }>;
-
-  constructor(
-    cid: string,
-    attempts: Array<{
-      gateway: string;
-      attempt: number;
-      status: number | null;
-      message: string;
-    }>
-  ) {
-    super(`Gateway fetch failed for CID ${cid} after ${attempts.length} attempts`);
-    this.attempts = attempts;
-  }
-}
-
-const defaultIpfsGateways = [
-  "https://ipfs.filebase.io",
-  "https://gateway.pinata.cloud",
-  "https://dweb.link",
-];
-
-const ipfsGateways = (process.env.IPFS_GATEWAYS || defaultIpfsGateways.join(","))
-  .split(",")
-  .map((g) => g.trim().replace(/\/+$/, ""))
-  .filter(Boolean);
-const ipfsFetchTimeoutMs = Number(process.env.IPFS_FETCH_TIMEOUT_MS || 8000);
-const ipfsRetriesPerGateway = Math.max(0, Number(process.env.IPFS_RETRIES_PER_GATEWAY || 1));
-const ipfsCacheTtlMs = Number(process.env.IPFS_CACHE_TTL_MS || 10 * 60 * 1000);
-const ipfsCacheMaxEntries = Math.max(1, Number(process.env.IPFS_CACHE_MAX_ENTRIES || 500));
-const ipfsCidCache = new Map<string, { bytes: Buffer; expiresAtMs: number; gateway: string }>();
-
 function loadDeploymentAddress(): string {
   const explicitAddress = process.env.CERTIFICATE_REGISTRY_ADDRESS;
   if (explicitAddress) return explicitAddress;
@@ -518,120 +384,7 @@ function resolveRpcUrl(): string {
   return "http://127.0.0.1:8545";
 }
 
-async function fetchCidBytes(cid: string): Promise<Buffer> {
-  const cached = ipfsCidCache.get(cid);
-  if (cached && cached.expiresAtMs > Date.now()) {
-    return cached.bytes;
-  }
-  if (cached) {
-    ipfsCidCache.delete(cid);
-  }
-
-  const attempts: Array<{
-    gateway: string;
-    attempt: number;
-    status: number | null;
-    message: string;
-  }> = [];
-
-  for (const gateway of ipfsGateways) {
-    for (let attempt = 1; attempt <= ipfsRetriesPerGateway + 1; attempt += 1) {
-      const url = `${gateway}/ipfs/${cid}`;
-
-      try {
-        const response = await axios.get(url, {
-          responseType: "arraybuffer",
-          maxBodyLength: Infinity,
-          timeout: ipfsFetchTimeoutMs,
-          validateStatus: () => true,
-        });
-
-        if (response.status === 200) {
-          const bytes = Buffer.from(response.data);
-          if (ipfsCidCache.size >= ipfsCacheMaxEntries) {
-            const oldestKey = ipfsCidCache.keys().next().value;
-            if (oldestKey) ipfsCidCache.delete(oldestKey);
-          }
-          ipfsCidCache.set(cid, {
-            bytes,
-            expiresAtMs: Date.now() + ipfsCacheTtlMs,
-            gateway,
-          });
-          return bytes;
-        }
-
-        const preview = Buffer.from(response.data).toString("utf8").slice(0, 200);
-        attempts.push({
-          gateway,
-          attempt,
-          status: response.status,
-          message: preview || `HTTP ${response.status}`,
-        });
-      } catch (err: any) {
-        attempts.push({
-          gateway,
-          attempt,
-          status: null,
-          message: err?.code ? `${err.code}: ${err.message}` : err?.message || String(err),
-        });
-      }
-    }
-  }
-
-  throw new GatewayFetchError(cid, attempts);
-}
-
-type PinnedMetadata = {
-  certId: string;
-  fileCid: string;
-  fileHash: string;
-  [key: string]: unknown;
-};
-
-async function pinBufferToIpfs(
-  buffer: Buffer,
-  filename: string,
-  jwt: string,
-  metadataName?: string
-): Promise<string> {
-  const url = "https://api.pinata.cloud/pinning/pinFileToIPFS";
-  const form = new FormData();
-  form.append("file", buffer, { filename });
-
-  if (metadataName) {
-    form.append("pinataMetadata", JSON.stringify({ name: metadataName }));
-  }
-
-  const pinataRes = await axios.post(url, form, {
-    headers: {
-      Authorization: `Bearer ${jwt}`,
-      ...form.getHeaders(),
-    },
-    maxBodyLength: Infinity,
-  });
-
-  const cid = pinataRes.data?.IpfsHash;
-  if (!cid) {
-    throw new Error("Pinata response missing IpfsHash");
-  }
-
-  return cid;
-}
-
-async function pinJsonToIpfs(obj: unknown, jwt: string, filename: string): Promise<string> {
-  const bytes = Buffer.from(JSON.stringify(obj), "utf8");
-  return pinBufferToIpfs(bytes, filename, jwt, filename);
-}
-
-async function fetchCidJson<T>(cid: string): Promise<T> {
-  const bytes = await fetchCidBytes(cid);
-  const jsonText = bytes.toString("utf8");
-  try {
-    return JSON.parse(jsonText) as T;
-  } catch {
-    throw new Error(`CID ${cid} did not contain valid JSON`);
-  }
-}
+type PinnedMetadata = PublicPinnedMetadata;
 
 type AuthClaims = {
   address: string;
@@ -2417,12 +2170,8 @@ app.post("/api/pin", ...institutionPinGuard(authRateLimiter), pinRateLimiter, up
       if (req.file.mimetype === "application/pdf") {
         pdfBytesForPinning = await embedVerificationMetadataInPdf(req.file.buffer, {
           certId,
-          title,
-          recipient,
-          institutionName,
           version,
           replacesCertId,
-          verificationUrl,
           sourceHash,
           embeddedAtIso,
         });
@@ -2433,23 +2182,37 @@ app.post("/api/pin", ...institutionPinGuard(authRateLimiter), pinRateLimiter, up
       console.warn("PDF metadata embedding failed, continuing with original file:", pdfMetadataEmbedError);
     }
 
-    const fileHash = sha256Hex(pdfBytesForPinning);
+    const plaintextPinnedHash = `0x${sha256Hex(pdfBytesForPinning)}`;
+    const { encryptedBytes, summary: encryptedBlob } = encryptPinnedFile(pdfBytesForPinning);
+    const encryptedFilenameBase = path.parse(req.file.originalname || "certificate").name || "certificate";
+    const encryptedFilename = `${encryptedFilenameBase}.enc.bin`;
+    const fileHash = sha256Hex(encryptedBytes);
     const fileCid = await pinBufferToIpfs(
-      pdfBytesForPinning,
-      req.file.originalname,
+      encryptedBytes,
+      encryptedFilename,
       jwt,
-      req.file.originalname
+      encryptedFilename
     );
 
-    const metadataDoc: PinnedMetadata = {
+    const metadataDoc = buildPublicPinnedMetadata({
+      certId,
+      fileHash: `0x${fileHash}`,
+      version,
+      replacesCertId,
+    });
+    const issueSummary: Record<string, unknown> = {
       certId,
       fileCid,
       fileHash: `0x${fileHash}`,
+      plaintextPinnedHash,
+      storageMode: "encrypted-blob",
+      encryptionAlg: encryptedBlob.alg,
+      fileEnvelopeFormat: encryptedBlob.format,
+      encryptionKeyId: encryptedBlob.keyId,
+      encryptedBlob,
       title,
       recipient,
       institutionName,
-      version,
-      replacesCertId,
       sourceFileName: req.file.originalname,
       sourceFileType: req.file.mimetype,
       createdAt: embeddedAtIso,
@@ -2458,18 +2221,14 @@ app.post("/api/pin", ...institutionPinGuard(authRateLimiter), pinRateLimiter, up
       pdfMetadataEmbedded,
       embeddedPdfMetadata: {
         certId,
-        title,
-        recipient,
-        institutionName,
         version,
         replacesCertId,
-        verificationUrl,
         sourceHash,
         embeddedAtIso,
       },
     };
     if (pdfMetadataEmbedError) {
-      metadataDoc.pdfMetadataEmbedError = pdfMetadataEmbedError;
+      issueSummary.pdfMetadataEmbedError = pdfMetadataEmbedError;
     }
 
     const metadataCid = await pinJsonToIpfs(
@@ -2482,57 +2241,52 @@ app.post("/api/pin", ...institutionPinGuard(authRateLimiter), pinRateLimiter, up
       metadataCid,
       fileCid,
       fileHash: `0x${fileHash}`,
+      plaintextPinnedHash,
       verificationUrl,
       sourceHash,
       pdfMetadataEmbedded,
       pdfMetadataEmbedError: pdfMetadataEmbedError || null,
-      metadata: metadataDoc,
+      storageMode: "encrypted-blob",
+      encryptionAlg: encryptedBlob.alg,
+      metadata: issueSummary,
+      publicMetadata: metadataDoc,
       // Backward-compat alias
       cid: fileCid,
     });
   } catch (err: any) {
     const status = err?.response?.status;
     const details = err?.response?.data || err?.message || String(err);
+    const isPinataFailure = Number.isInteger(status) && status > 0;
 
-    console.error("Pinata upload failed. Status:", status);
+    console.error(isPinataFailure ? "Pinata upload failed. Status:" : "Pin/encryption failed. Status:", status);
     console.error("Details:", details);
 
-    return res.status(500).json({
-      error: "Pinata upload failed",
-      status,
-      details,
-    });
+    return res.status(500).json(
+      isPinataFailure
+        ? {
+            error: "Pinata upload failed",
+            status,
+            details,
+          }
+        : {
+            error: "Pin/encryption failed",
+            details,
+          }
+    );
   }
 });
 
 
 app.get("/api/fetch/:cid", async (req, res) => {
-  try {
-    const { cid } = req.params;
-    const rawFile = await fetchCidBytes(cid);
-    res.setHeader("Content-Type", "application/octet-stream");
-    res.send(rawFile);
-  } catch (err: any) {
-    if (err instanceof GatewayFetchError) {
-      return res.status(502).json({
-        error: "Gateway fetch failed",
-        cid: req.params.cid,
-        attempts: err.attempts,
-      });
-    }
-
-    console.error("Fetch crashed:", err?.message);
-    return res.status(500).json({
-      error: "Fetch crashed",
-      message: err?.message || String(err),
-    });
-  }
+  return res.status(403).json({
+    error: "Raw file download is disabled on the public API",
+    message: "Use an authenticated issuer workflow to access certificate files.",
+  });
 });
 
 
 app.get("/api/verify/:certId", verifyRateLimiter, async (req, res) => {
   let metadataCidForError: string | undefined;
-  let fileCidForError: string | undefined;
 
   try {
     const requestedCertId = normalizeCertId(toSingleString(req.params.certId));
@@ -2591,14 +2345,14 @@ app.get("/api/verify/:certId", verifyRateLimiter, async (req, res) => {
     }
 
     const metadata = await fetchCidJson<PinnedMetadata>(metadataCid);
-    const metadataFileCid = String(metadata?.fileCid || "").trim();
     const rawMetadataFileHash = String(metadata?.fileHash || "").trim().toLowerCase();
     const metadataFileHash =
       rawMetadataFileHash && !rawMetadataFileHash.startsWith("0x")
         ? `0x${rawMetadataFileHash}`
         : rawMetadataFileHash;
-    const resolvedFileCid = metadataFileCid || fileCidOnChain;
-    fileCidForError = resolvedFileCid;
+    const storageMode = String(metadata?.storageMode || "encrypted-blob").trim() || "encrypted-blob";
+    const encryptionAlg = String(metadata?.encryptionAlg || "aes-256-gcm").trim() || "aes-256-gcm";
+    const resolvedFileCid = String(fileCidOnChain || "").trim();
 
     if (!resolvedFileCid) {
       return res.status(422).json({
@@ -2619,7 +2373,8 @@ app.get("/api/verify/:certId", verifyRateLimiter, async (req, res) => {
       exists: true,
       revoked: Boolean(revoked),
       metadataCid,
-      fileCid: resolvedFileCid,
+      storageMode,
+      encryptionAlg,
       issuer,
       version: Number(version),
       replacesCertId,
@@ -2628,7 +2383,6 @@ app.get("/api/verify/:certId", verifyRateLimiter, async (req, res) => {
       computedHash,
       integrityMatch,
       metadataHashMatch,
-      metadata,
       status: integrityMatch && !revoked ? "VALID" : revoked ? "REVOKED" : "TAMPERED",
     });
   } catch (err: any) {
@@ -2652,7 +2406,6 @@ app.get("/api/verify/:certId", verifyRateLimiter, async (req, res) => {
         error: "Gateway fetch failed during verification",
         certId: normalizeCertId(req.params.certId),
         metadataCid: metadataCidForError,
-        fileCid: fileCidForError,
         attempts: err.attempts,
       });
     }
@@ -2672,7 +2425,8 @@ async function buildVerificationProof(certIdInput: string): Promise<{
   txHash: string;
   revokeTxHash: string | null;
   metadataCid: string;
-  fileCid: string;
+  storageMode: string;
+  encryptionAlg: string;
   onChainHash: string;
   computedHash: string;
   metadataFileHash: string | null;
@@ -2683,8 +2437,6 @@ async function buildVerificationProof(certIdInput: string): Promise<{
   replacesCertId: string;
   issuedAt: number;
   revoked: boolean;
-  title: string;
-  institutionName: string;
 }> {
   const requestedCertId = normalizeCertId(certIdInput);
   if (!requestedCertId) {
@@ -2729,13 +2481,14 @@ async function buildVerificationProof(certIdInput: string): Promise<{
     throw new Error("Certificate metadata CID is missing on-chain");
   }
   const metadata = await fetchCidJson<PinnedMetadata>(metadataCid);
-  const metadataFileCid = String(metadata?.fileCid || "").trim();
   const rawMetadataFileHash = String(metadata?.fileHash || "").trim().toLowerCase();
   const metadataFileHash =
     rawMetadataFileHash && !rawMetadataFileHash.startsWith("0x")
       ? `0x${rawMetadataFileHash}`
       : rawMetadataFileHash || null;
-  const resolvedFileCid = metadataFileCid || fileCidOnChain;
+  const storageMode = String(metadata?.storageMode || "encrypted-blob").trim() || "encrypted-blob";
+  const encryptionAlg = String(metadata?.encryptionAlg || "aes-256-gcm").trim() || "aes-256-gcm";
+  const resolvedFileCid = String(fileCidOnChain || "").trim();
   if (!resolvedFileCid) {
     throw new Error("Metadata missing fileCid and no on-chain fileCid available");
   }
@@ -2756,7 +2509,8 @@ async function buildVerificationProof(certIdInput: string): Promise<{
     txHash: String(historyEntry?.issueTxHash || ""),
     revokeTxHash: historyEntry?.revokeTxHash || null,
     metadataCid: String(metadataCid || ""),
-    fileCid: String(resolvedFileCid || ""),
+    storageMode,
+    encryptionAlg,
     onChainHash: String(onChainHash || ""),
     computedHash,
     metadataFileHash,
@@ -2767,8 +2521,6 @@ async function buildVerificationProof(certIdInput: string): Promise<{
     replacesCertId,
     issuedAt: Number(issuedAt || 0),
     revoked: Boolean(revoked),
-    title: String(metadata?.title || "").trim(),
-    institutionName: String(metadata?.institutionName || metadata?.institution_name || "").trim(),
   };
 }
 
@@ -2807,10 +2559,11 @@ app.get("/api/proof/:certId.pdf", async (req, res) => {
       ["Status", proof.status],
       ["certId", proof.certId],
       ["Issuer", proof.issuer],
+      ["storageMode", proof.storageMode],
+      ["encryptionAlg", proof.encryptionAlg],
       ["txHash", proof.txHash || "-"],
       ["revokeTxHash", proof.revokeTxHash || "-"],
       ["metadataCid", proof.metadataCid],
-      ["fileCid", proof.fileCid],
       ["onChainHash", proof.onChainHash],
       ["computedHash", proof.computedHash],
       ["metadataFileHash", proof.metadataFileHash || "-"],
@@ -3348,18 +3101,17 @@ app.post("/api/issue", async (req, res) => {
         });
       }
 
-      const metadataExtras =
-        metadataInput && typeof metadataInput === "object" && !Array.isArray(metadataInput)
-          ? (metadataInput as Record<string, unknown>)
-          : {};
-      pinnedMetadata = {
-        ...metadataExtras,
+      if (metadataInput && (typeof metadataInput !== "object" || Array.isArray(metadataInput))) {
+        return respondIssue(400, {
+          error: "metadata must be an object when provided",
+        });
+      }
+      pinnedMetadata = buildPublicPinnedMetadata({
         certId,
-        fileCid,
         fileHash: fileHash.toLowerCase(),
         version,
         replacesCertId,
-      };
+      });
       metadataCid = await pinJsonToIpfs(
         pinnedMetadata,
         pinJwt,

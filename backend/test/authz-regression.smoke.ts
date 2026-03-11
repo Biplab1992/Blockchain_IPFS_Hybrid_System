@@ -57,8 +57,7 @@ async function ensureMoeToken(): Promise<string> {
 
 async function main() {
   if (!API) {
-    console.log("Skipping authorization regression checks (TEST_API_BASE is not set).");
-    return;
+    throw new Error("TEST_API_BASE is required for backend integration authorization checks.");
   }
 
   const individualEmail = `ind_${Date.now()}@example.com`;
@@ -181,4 +180,3 @@ main().catch((err) => {
   console.error("Authorization regression checks failed:", err?.message || String(err));
   process.exit(1);
 });
-

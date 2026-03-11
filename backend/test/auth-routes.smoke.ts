@@ -16,8 +16,7 @@ async function req(path: string, init?: RequestInit): Promise<{ status: number; 
 
 async function main() {
   if (!API) {
-    console.log("Skipping auth smoke checks (TEST_API_BASE is not set).");
-    return;
+    throw new Error("TEST_API_BASE is required for backend integration smoke checks.");
   }
 
   const email = `smoke_${Date.now()}@example.com`;
