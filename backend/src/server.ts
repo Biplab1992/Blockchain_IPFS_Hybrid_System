@@ -466,9 +466,9 @@ class GatewayFetchError extends Error {
 }
 
 const defaultIpfsGateways = [
-  "https://ipfs.io",
+  "https://ipfs.filebase.io",
   "https://gateway.pinata.cloud",
-  "https://cloudflare-ipfs.com",
+  "https://dweb.link",
 ];
 
 const ipfsGateways = (process.env.IPFS_GATEWAYS || defaultIpfsGateways.join(","))
@@ -765,7 +765,9 @@ function toCertificateRow(entry: CertificateIndexEntry): CertificateRow {
     issue_tx: entry.issueTxHash || null,
     revoke_tx: entry.revokeTxHash || null,
     block_number: entry.issueBlockNumber || null,
-    // Keep payload minimal for compatibility with earlier table schemas.
+    revoke_block_number: entry.revokeBlockNumber || null,
+    issued_at: entry.issuedAt || null,
+    revoked_at: entry.revokedAt ?? null,
     updated_at: new Date().toISOString(),
   };
 }
@@ -3601,3 +3603,4 @@ app.use((err: unknown, req: express.Request, res: express.Response, _next: expre
 
   return res.status(500).json({ error: "Unhandled server error" });
 });
+

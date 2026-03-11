@@ -1,4 +1,6 @@
 import crypto from "crypto";
+import fs from "fs";
+import path from "path";
 import type express from "express";
 import axios from "axios";
 import bcrypt from "bcryptjs";
@@ -35,10 +37,32 @@ type AuthReq = express.Request & {
 };
 
 type User = { id: string; email: string; password_hash: string; role: Role; email_verified: boolean };
-type Institution = { id: string; name: string; status: InstitutionStatus; admin_email: string; issuer_wallet: string };
+type Institution = {
+  id: string;
+  name: string;
+  status: InstitutionStatus;
+  admin_email: string;
+  issuer_wallet: string;
+  authorization_request_status?: string | null;
+  authorization_request_note?: string | null;
+  authorization_requested_at?: string | null;
+  authorization_request_resolved_at?: string | null;
+};
 type InstitutionUser = { user_id: string; institution_id: string; is_primary_admin: boolean };
 type WalletBinding = { institution_id: string; wallet_address: string; verified: boolean; verified_at: string | null };
 type RefreshToken = { user_id: string; token_hash: string; expires_at: string; revoked_at: string | null };
+type AuthorizationRequestStatus = "PENDING" | "APPROVED" | "REJECTED" | "CANCELLED";
+type AuthorizationRequest = {
+  id: string;
+  institution_id: string;
+  requester_user_id: string | null;
+  issuer_wallet: string;
+  status: AuthorizationRequestStatus;
+  note: string | null;
+  resolved_by_user_id: string | null;
+  resolved_at: string | null;
+  created_at?: string | null;
+};
 type PasswordResetToken = {
   id: string;
   user_id: string;
@@ -91,6 +115,38 @@ function supabaseUrl(): string {
 
 function serviceKey(): string {
   return (process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
+}
+
+function workspaceRoot(): string {
+  return path.resolve(process.cwd());
+}
+
+function resolveContractAddress(): string {
+  const direct = (process.env.CERTIFICATE_REGISTRY_ADDRESS || "").trim();
+  if (direct) return direct;
+
+  const deploymentsFile = path.join(workspaceRoot(), "contracts", "deployments.json");
+  if (!fs.existsSync(deploymentsFile)) return "";
+
+  const networkName = (process.env.CONTRACT_NETWORK_NAME || "localhost").trim();
+  const deployments = JSON.parse(fs.readFileSync(deploymentsFile, "utf8")) as Record<
+    string,
+    { CertificateRegistry?: string }
+  >;
+  return String(deployments?.[networkName]?.CertificateRegistry || "").trim();
+}
+
+function resolveRpcUrl(): string {
+  const direct = (process.env.RPC_URL || "").trim();
+  if (direct) return direct;
+
+  const networkName = (process.env.CONTRACT_NETWORK_NAME || "localhost").trim().toLowerCase();
+  if (networkName === "sepolia") {
+    const sepolia = (process.env.SEPOLIA_RPC_URL || "").trim();
+    if (sepolia) return sepolia;
+  }
+
+  return "http://127.0.0.1:8545";
 }
 
 function authDomain(): string {
@@ -526,8 +582,8 @@ async function institutionCtx(userId: string): Promise<{ institution: Institutio
 }
 
 async function onchainAuthorized(wallet: string): Promise<boolean> {
-  const rpc = process.env.RPC_URL || "";
-  const caddr = process.env.CERTIFICATE_REGISTRY_ADDRESS || "";
+  const rpc = resolveRpcUrl();
+  const caddr = resolveContractAddress();
   if (!rpc || !caddr) return false;
   const c = new Contract(caddr, CERT_ABI, new JsonRpcProvider(rpc));
   return (await c.getFunction("authorizedIssuers").staticCall(wallet)) as boolean;
@@ -602,6 +658,7 @@ const zStatus = z.object({ status: z.enum(["ACTIVE", "SUSPENDED"]) });
 const zResend = z.object({ email: z.string().email().transform((v) => v.toLowerCase()).optional() });
 const zWalletNonce = z.object({ walletAddress: z.string().min(42).max(42) });
 const zWalletVerify = z.object({ walletAddress: z.string().min(42).max(42), nonce: z.string().min(8), signature: z.string().min(20) });
+const zAuthorizationRequestCreate = z.object({ note: z.string().max(500).optional() });
 
 export function institutionPinGuard(authLimiter: express.RequestHandler): express.RequestHandler[] {
   return [
@@ -944,6 +1001,75 @@ export function registerSecurityRoutes(app: express.Express, authLimiter: expres
     return res.json({ data: rows });
   });
 
+  app.get("/api/moe/authorization-requests", auth, roles("MOE_ADMIN"), async (req, res) => {
+    const status = String(req.query.status || "").trim().toUpperCase();
+    const params: Record<string, string> = {
+      select: "id,name,issuer_wallet,authorization_request_status,authorization_request_note,authorization_requested_at",
+      order: "authorization_requested_at.desc",
+    };
+    if (status) params.authorization_request_status = `eq.${status}`;
+    const rows = await db<Institution[]>({
+      method: "GET",
+      table: "institutions",
+      params,
+    });
+    return res.json({
+      data: rows
+        .filter((row) => String(row?.authorization_request_status || "").trim())
+        .map((row) => ({
+          id: `${row.id}:institution-request`,
+          institution_id: row.id,
+          issuer_wallet: row.issuer_wallet,
+          status: row.authorization_request_status,
+          note: row.authorization_request_note || null,
+          created_at: row.authorization_requested_at || null,
+          institution_name: row.name,
+        })),
+    });
+  });
+
+  app.post("/api/moe/institutions/:id/authorization-requests/approve", auth, roles("MOE_ADMIN"), async (req: AuthReq, res) => {
+    try {
+      const id = String(req.params.id || "").trim();
+      if (!id) return res.status(400).json({ error: "Institution id required" });
+      await db({
+        method: "PATCH",
+        table: "institutions",
+        params: {
+          id: `eq.${id}`,
+        },
+        body: {
+          authorization_request_status: "APPROVED",
+          authorization_request_resolved_at: new Date().toISOString(),
+        },
+        prefer: "return=minimal",
+      });
+      await db({
+        method: "PATCH",
+        table: "authorization_requests",
+        params: {
+          institution_id: `eq.${id}`,
+          status: "eq.PENDING",
+        },
+        body: {
+          status: "APPROVED",
+          resolved_by_user_id: req.auth!.userId,
+          resolved_at: new Date().toISOString(),
+        },
+        prefer: "return=minimal",
+      }).catch(() => {});
+      await audit({
+        actorUserId: req.auth!.userId,
+        action: "MOE_AUTHORIZATION_REQUEST_APPROVED",
+        entityType: "institution",
+        entityId: id,
+      });
+      return res.json({ ok: true });
+    } catch (e: any) {
+      return res.status(400).json({ error: "Failed to approve authorization requests", details: e?.message || String(e) });
+    }
+  });
+
   app.post("/api/moe/institutions/:id/resend-invite", auth, roles("MOE_ADMIN"), async (req: AuthReq, res) => {
     try {
       const b = zResend.parse(req.body || {});
@@ -969,6 +1095,143 @@ export function registerSecurityRoutes(app: express.Express, authLimiter: expres
       institution: { id: ctx.institution.id, name: ctx.institution.name, status: ctx.institution.status, adminEmail: ctx.institution.admin_email, issuerWallet: ctx.institution.issuer_wallet },
       binding: { verified: Boolean(ctx.binding?.verified), walletAddress: ctx.binding?.wallet_address || null, verifiedAt: ctx.binding?.verified_at || null },
     });
+  });
+
+  app.get("/api/institution/authorization-requests/latest", auth, roles("INSTITUTION_ADMIN"), async (req: AuthReq, res) => {
+    const ctx = await institutionCtx(req.auth!.userId);
+    if (!ctx) return res.status(403).json({ error: "No institution mapping" });
+    if (String(ctx.institution.authorization_request_status || "").trim()) {
+      return res.json({
+        request: {
+          id: `${ctx.institution.id}:institution-request`,
+          institution_id: ctx.institution.id,
+          requester_user_id: req.auth!.userId,
+          issuer_wallet: ctx.institution.issuer_wallet,
+          status: ctx.institution.authorization_request_status,
+          note: ctx.institution.authorization_request_note || null,
+          resolved_by_user_id: null,
+          resolved_at: ctx.institution.authorization_request_resolved_at || null,
+          created_at: ctx.institution.authorization_requested_at || null,
+        },
+      });
+    }
+    const rows = await db<AuthorizationRequest[]>({
+      method: "GET",
+      table: "authorization_requests",
+      params: {
+        select: "*",
+        institution_id: `eq.${ctx.institution.id}`,
+        order: "created_at.desc",
+        limit: "1",
+      },
+    });
+    return res.json({ request: rows[0] || null });
+  });
+
+  app.post("/api/institution/authorization-requests", auth, roles("INSTITUTION_ADMIN"), async (req: AuthReq, res) => {
+    try {
+      const b = zAuthorizationRequestCreate.parse(req.body || {});
+      const ctx = await institutionCtx(req.auth!.userId);
+      if (!ctx) return res.status(403).json({ error: "No institution mapping" });
+
+      const issuerWallet = String(ctx.institution.issuer_wallet || "").trim().toLowerCase();
+      if (!issuerWallet) return res.status(400).json({ error: "Institution issuer wallet is missing" });
+      if (await onchainAuthorized(issuerWallet)) {
+        return res.status(409).json({ error: "Institution wallet is already authorized on-chain" });
+      }
+
+      if (String(ctx.institution.authorization_request_status || "").trim().toUpperCase() === "PENDING") {
+        return res.status(409).json({
+          error: "A pending authorization request already exists",
+          request: {
+            id: `${ctx.institution.id}:institution-request`,
+            institution_id: ctx.institution.id,
+            requester_user_id: req.auth!.userId,
+            issuer_wallet: issuerWallet,
+            status: "PENDING",
+            note: ctx.institution.authorization_request_note || null,
+            resolved_by_user_id: null,
+            resolved_at: ctx.institution.authorization_request_resolved_at || null,
+            created_at: ctx.institution.authorization_requested_at || null,
+          },
+        });
+      }
+
+      const existing = await db<AuthorizationRequest[]>({
+        method: "GET",
+        table: "authorization_requests",
+        params: {
+          select: "*",
+          institution_id: `eq.${ctx.institution.id}`,
+          status: "eq.PENDING",
+          order: "created_at.desc",
+          limit: "1",
+        },
+      });
+      if (existing[0]) {
+        return res.status(409).json({ error: "A pending authorization request already exists", request: existing[0] });
+      }
+
+      const requestedAt = new Date().toISOString();
+      await db({
+        method: "PATCH",
+        table: "institutions",
+        params: { id: `eq.${ctx.institution.id}` },
+        body: {
+          authorization_request_status: "PENDING",
+          authorization_request_note: String(b.note || "").trim() || null,
+          authorization_requested_at: requestedAt,
+          authorization_request_resolved_at: null,
+        },
+        prefer: "return=minimal",
+      });
+
+      const created = await db<AuthorizationRequest[]>({
+        method: "POST",
+        table: "authorization_requests",
+        body: [{
+          institution_id: ctx.institution.id,
+          requester_user_id: req.auth!.userId,
+          issuer_wallet: issuerWallet,
+          status: "PENDING",
+          note: String(b.note || "").trim() || null,
+        }],
+        prefer: "return=representation",
+      }).catch(() => []);
+      await audit({
+        actorUserId: req.auth!.userId,
+        actorWallet: ctx.binding?.wallet_address || null,
+        action: "INSTITUTION_AUTHORIZATION_REQUESTED",
+        entityType: "institution",
+        entityId: ctx.institution.id,
+        metadata: { issuerWallet, note: String(b.note || "").trim() || null },
+      });
+      logEvent("info", "institution_authorization_request_created", {
+        institutionId: ctx.institution.id,
+        requesterUserId: req.auth!.userId,
+        issuerWallet,
+      });
+      return res.status(201).json({
+        ok: true,
+        request: created[0] || {
+          id: `${ctx.institution.id}:institution-request`,
+          institution_id: ctx.institution.id,
+          requester_user_id: req.auth!.userId,
+          issuer_wallet: issuerWallet,
+          status: "PENDING",
+          note: String(b.note || "").trim() || null,
+          resolved_by_user_id: null,
+          resolved_at: null,
+          created_at: requestedAt,
+        },
+      });
+    } catch (e: any) {
+      logEvent("error", "institution_authorization_request_failed", {
+        error: e?.message || String(e),
+        details: e?.response?.data || null,
+      });
+      return res.status(400).json({ error: "Invalid authorization request payload", details: e?.message || String(e) });
+    }
   });
 
   app.post("/api/institution/wallet/nonce", auth, roles("INSTITUTION_ADMIN"), async (req: AuthReq, res) => {
