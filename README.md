@@ -34,8 +34,10 @@ certId -> backend reads chain -> fetches metadata/encrypted blob from IPFS -> re
 - npm 10+
 - MetaMask (for wallet-native issue/revoke)
 - Hardhat (installed from local `contracts/` dependencies)
-- Pinata JWT (for backend pinning)
-- Optional: Sepolia RPC + funded deployer wallet + Etherscan key
+- Pinata JWT (required for upload/issue flow via `POST /api/pin`)
+- Optional for local public verify/pin demo only: Supabase
+- Required for auth/RBAC/MoE/institution admin flows: Supabase project URL + service role key
+- Optional for testnet deployments: Sepolia RPC + funded deployer wallet + Etherscan key
 
 ## Repository Structure
 
@@ -66,9 +68,14 @@ copy contracts\.env.example contracts\.env
 ```
 
 Minimum important variables:
-- `backend/.env`: `PINATA_JWT`, `FILE_ENCRYPTION_KEY`, `JWT_SECRET`, `RPC_URL`, `CONTRACT_NETWORK_NAME`, `PUBLIC_VERIFY_BASE_URL`
-- `contracts/.env`: `DEPLOYER_PRIVATE_KEY` (for deploy scripts using raw signer)
+- `backend/.env`: `PINATA_JWT`, `FILE_ENCRYPTION_KEY`, `JWT_SECRET`, `JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET`, `RPC_URL`, `CONTRACT_NETWORK_NAME`
+- `contracts/.env`: `DEPLOYER_PRIVATE_KEY` only when using raw signer deploy/testnet scripts
 - `app/.env`: `VITE_API_BASE_URL`, `VITE_CONTRACT_ADDRESS`, `VITE_CHAIN_ID`, `VITE_RPC_URL`
+
+Local demo notes:
+- `PUBLIC_VERIFY_BASE_URL` is optional for local development. Leave it blank unless you want QR codes to point at a public URL.
+- `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are optional only if you are testing the public pin/verify flow without auth/RBAC features.
+- `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are required if you want `/api/auth/*`, `/api/moe/*`, `/api/institution/*`, invitation flows, or persistent database-backed admin state.
 
 Additional auth variables (`backend/.env`):
 - `JWT_ACCESS_SECRET`
@@ -78,7 +85,7 @@ Additional auth variables (`backend/.env`):
 - `AUTH_RATE_WINDOW_MS`
 - `AUTH_RATE_MAX`
 
-If using Supabase indexer, also set:
+If using Supabase-backed auth/indexer flows, also set:
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
 
@@ -111,11 +118,15 @@ If using Supabase indexer, also set:
 ## Install Dependencies
 
 ```bash
-cd app && npm install
-cd ..\backend && npm install
-cd ..\contracts && npm install
-cd ..
+npm install
+npm --prefix app install
+npm --prefix backend install
+npm --prefix contracts install
 ```
+
+Notes:
+- Root `npm install` is needed for root scripts such as `npm run dev` and `npm run dev:all`.
+- If you only want to work inside one package, you can install that package on its own.
 
 ## Local Development (Hardhat + Frontend + Backend)
 
@@ -139,14 +150,36 @@ Update `app/.env` and/or `backend/.env` with the deployed contract address:
 - `VITE_CONTRACT_ADDRESS=...`
 - `CERTIFICATE_REGISTRY_ADDRESS=...` (optional if using `contracts/deployments.json`)
 
-### 3. Start backend
+Notes:
+- The frontend needs `VITE_CONTRACT_ADDRESS` set correctly.
+- The backend can usually read the address from `contracts/deployments.json`, so `CERTIFICATE_REGISTRY_ADDRESS` is optional for local deploys.
+
+### 3. Decide which wallet will issue certificates
+
+The contract deployer is automatically added to the issuer allowlist at construction time.
+
+Simplest local option:
+- Import the local Hardhat deployer account into MetaMask and use that wallet to issue/revoke.
+
+If you want to use a different MetaMask wallet:
+1. Put the wallet address into `contracts/.env` as `ISSUER_ADDRESS=0x...`
+2. Run:
+
+```bash
+cd contracts
+npx hardhat run scripts/set-issuer.ts --network localhost
+```
+
+Without this step, issuance from a non-authorized wallet will revert with `Issuer not authorised`.
+
+### 4. Start backend
 
 ```bash
 cd backend
 npm run dev
 ```
 
-### 4. Start frontend
+### 5. Start frontend
 
 ```bash
 cd app
@@ -154,6 +187,11 @@ npm run dev
 ```
 
 Open `http://localhost:5173`.
+
+Optional root shortcuts:
+- `npm run dev` starts backend + frontend together after your chain/contract are already ready.
+- `npm run dev:all` is a Windows PowerShell convenience script that starts chain, deploys, backend, and frontend together.
+- `npm run dev:all` does not auto-authorize a different MetaMask wallet; you still need the `set-issuer.ts` step if you are not using the deployer wallet.
 
 ## Public QR Verification (Any Network)
 
@@ -201,15 +239,29 @@ Notes:
 - `npm --prefix backend run test:e2e-full` exercises the authenticated backend flow and, when `TEST_FULL_CHAIN_E2E=1`, the on-chain issue/verify path using PDF uploads.
 - `npm --prefix app run test:ui` runs the Vitest/RTL frontend tests directly.
 
-## Supabase Issuer Index
+## Supabase Database Setup
 
-Run the SQL in [`backend/supabase/schema.sql`](backend/supabase/schema.sql) to create:
+Run the SQL in [`backend/supabase/schema.sql`](backend/supabase/schema.sql) before using any Supabase-backed features.
+
+The schema creates both index tables and auth/admin tables, including:
 - `certificates`
 - `indexer_state`
 - `issuer_status`
 - `issuer_events`
+- `users`
+- `institutions`
+- `institution_users`
+- `invitations`
+- `wallet_bindings`
+- `refresh_tokens`
+- `password_reset_tokens`
+- `authorization_requests`
+- `audit_logs`
 
-Issuer authorization remains on-chain. Supabase tables are index/audit copies populated from `IssuerAuthorizationUpdated` events.
+Notes:
+- If you only want the local public pin/verify flow, you can leave Supabase unset.
+- If you want auth, MoE admin, institution admin, invitations, password reset, or database-backed audit flows, Supabase is required.
+- Issuer authorization itself remains on-chain. Supabase stores index/audit/application state around those on-chain events.
 
 ## Auth + RBAC
 
@@ -217,6 +269,8 @@ Roles:
 - `MOE_ADMIN`
 - `INSTITUTION_ADMIN`
 - `INDIVIDUAL`
+
+These routes require `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, and the schema from [`backend/supabase/schema.sql`](backend/supabase/schema.sql).
 
 Core auth endpoints:
 - `POST /api/auth/register` (individual)
