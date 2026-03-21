@@ -63,6 +63,36 @@ async function login(email: string, password: string): Promise<string> {
   return String(r.body.accessToken || "");
 }
 
+async function registerIndividual(email: string, password: string): Promise<string> {
+  const reg = await req("/api/auth/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password, role: "INDIVIDUAL" }),
+  });
+  assert.equal(
+    reg.status,
+    201,
+    `individual register failed for ${email}: ${reg.status} ${JSON.stringify(reg.body)}`
+  );
+  return String(reg.body.accessToken || "");
+}
+
+async function downloadCertificate(
+  certId: string,
+  token: string
+): Promise<{ status: number; bytes: Buffer; contentType: string; disposition: string }> {
+  const r = await fetch(`${API}/api/certificates/${encodeURIComponent(certId)}/download`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const bytes = Buffer.from(await r.arrayBuffer());
+  return {
+    status: r.status,
+    bytes,
+    contentType: String(r.headers.get("content-type") || ""),
+    disposition: String(r.headers.get("content-disposition") || ""),
+  };
+}
+
 async function ensureMoeToken(): Promise<string> {
   if (existingMoeEmail && existingMoePassword) {
     return login(existingMoeEmail, existingMoePassword);
@@ -121,6 +151,10 @@ async function main() {
 
   const institutionAdminPassword = "InstitutionE2ePass123!";
   const institutionAdminEmail = `inst_e2e_${Date.now()}@example.com`;
+  const studentPassword = "StudentE2ePass123!";
+  const studentEmail = `student_e2e_${Date.now()}@example.com`;
+  const otherStudentPassword = "OtherStudentE2ePass123!";
+  const otherStudentEmail = `other_student_e2e_${Date.now()}@example.com`;
   const issuerWallet = Wallet.createRandom();
 
   const moeToken = await ensureMoeToken();
@@ -167,6 +201,8 @@ async function main() {
   assert.equal(acceptInvite.status, 200, `invite accept failed: ${acceptInvite.status} ${JSON.stringify(acceptInvite.body)}`);
 
   const institutionToken = await login(institutionAdminEmail, institutionAdminPassword);
+  const studentToken = await registerIndividual(studentEmail, studentPassword);
+  const otherStudentToken = await registerIndividual(otherStudentEmail, otherStudentPassword);
 
   const nonceResp = await req("/api/institution/wallet/nonce", {
     method: "POST",
@@ -241,7 +277,8 @@ async function main() {
   const pinned = await pinFile(fileBytes, `${certId}.pdf`, institutionToken, issuerWallet.address.toLowerCase(), {
     certId,
     title: "E2E Certificate",
-    recipient: institutionAdminEmail,
+    recipient: "E2E Student",
+    recipientEmail: studentEmail,
     institutionName: String(profile.body?.institution?.name || "E2E Institute"),
     version: "1",
     replacesCertId: "",
@@ -252,7 +289,34 @@ async function main() {
   const issueTx = await issuerContract
     .getFunction("issueCertificate")
     .send(certId, pinned.metadataCid, pinned.fileCid, pinned.fileHash as `0x${string}`, 1, "");
-  await issueTx.wait();
+  const issueReceipt = await issueTx.wait();
+
+  const persistAccess = await req("/api/certificates/issue", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${institutionToken}`,
+    },
+    body: JSON.stringify({
+      certId,
+      metadataCid: pinned.metadataCid,
+      fileCid: pinned.fileCid,
+      txHash: issueReceipt?.hash || issueTx.hash,
+      connectedWallet: issuerWallet.address.toLowerCase(),
+      title: "E2E Certificate",
+      recipient: "E2E Student",
+      recipientEmail: studentEmail,
+      institutionName: String(profile.body?.institution?.name || "E2E Institute"),
+      sourceFileName: `${certId}.pdf`,
+      sourceFileType: "application/pdf",
+    }),
+  });
+  assert.equal(
+    persistAccess.status,
+    200,
+    `issue access persist failed: ${persistAccess.status} ${JSON.stringify(persistAccess.body)}`
+  );
+  assert.equal(Boolean(persistAccess.body?.privateAccessStored), true, "private access should be stored");
 
   const verifyResp = await waitFor(
     async () => req(`/api/verify/${encodeURIComponent(certId)}`),
@@ -264,7 +328,43 @@ async function main() {
   assert.equal(String(verifyResp.body?.status || ""), "VALID", `expected VALID, got ${JSON.stringify(verifyResp.body)}`);
   assert.equal(String(verifyResp.body?.storageMode || ""), "encrypted-blob", `expected encrypted-blob, got ${JSON.stringify(verifyResp.body)}`);
 
-  console.log("Full e2e flow passed (auth + invite + wallet bind + issue + verify).");
+  const institutionDownload = await downloadCertificate(certId, institutionToken);
+  assert.equal(institutionDownload.status, 200, `institution download failed: ${institutionDownload.status}`);
+  assert.ok(
+    institutionDownload.contentType.toLowerCase().includes("application/pdf"),
+    `expected PDF content-type, got ${institutionDownload.contentType}`
+  );
+  assert.ok(
+    institutionDownload.disposition.toLowerCase().includes("attachment;"),
+    `expected attachment disposition, got ${institutionDownload.disposition}`
+  );
+  assert.ok(
+    institutionDownload.bytes.subarray(0, 5).toString("utf8").startsWith("%PDF"),
+    "institution download should return a PDF"
+  );
+
+  const studentDownload = await downloadCertificate(certId, studentToken);
+  assert.equal(studentDownload.status, 200, `student download failed: ${studentDownload.status}`);
+  assert.ok(
+    studentDownload.bytes.subarray(0, 5).toString("utf8").startsWith("%PDF"),
+    "student download should return a PDF"
+  );
+
+  const moeDownload = await downloadCertificate(certId, moeToken);
+  assert.equal(moeDownload.status, 200, `MOE download failed: ${moeDownload.status}`);
+  assert.ok(
+    moeDownload.bytes.subarray(0, 5).toString("utf8").startsWith("%PDF"),
+    "MOE download should return a PDF"
+  );
+
+  const otherStudentDownload = await downloadCertificate(certId, otherStudentToken);
+  assert.equal(
+    otherStudentDownload.status,
+    403,
+    `unauthorized student should be denied: ${otherStudentDownload.status}`
+  );
+
+  console.log("Full e2e flow passed (auth + invite + wallet bind + issue + verify + secure download).");
 }
 
 main().catch((err) => {

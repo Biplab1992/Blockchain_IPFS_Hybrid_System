@@ -7,6 +7,20 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import { Contract, JsonRpcProvider, getAddress, verifyMessage } from "ethers";
 import { z } from "zod";
+import {
+  canRecipientAccessCertificate,
+  normalizeEmail,
+  sanitizeDownloadFilename,
+  toCertificatePrivateAccessRow,
+  type CertificatePrivateAccessInput,
+  type CertificatePrivateAccessRow,
+} from "./certificate-private-access.js";
+import {
+  ENCRYPTED_FILE_MAGIC,
+  decodeFileEncryptionKey,
+  decryptPinnedFileWithKey,
+} from "./file-envelope.js";
+import { fetchCidBytes, sha256Hex0x } from "./ipfs-client.js";
 
 type LogLevel = "info" | "warn" | "error";
 
@@ -50,6 +64,7 @@ type Institution = {
 };
 type InstitutionUser = { user_id: string; institution_id: string; is_primary_admin: boolean };
 type WalletBinding = { institution_id: string; wallet_address: string; verified: boolean; verified_at: string | null };
+type CertificatePrivateAccess = CertificatePrivateAccessRow;
 type RefreshToken = { user_id: string; token_hash: string; expires_at: string; revoked_at: string | null };
 type AuthorizationRequestStatus = "PENDING" | "APPROVED" | "REJECTED" | "CANCELLED";
 type AuthorizationRequest = {
@@ -86,7 +101,10 @@ const emailSendQueueMaxDelayMs = Math.max(emailSendQueueBaseDelayMs, Number(proc
 const emailSendQueueTickMs = Math.max(250, Number(process.env.EMAIL_SEND_QUEUE_TICK_MS || 2000));
 const passwordResetTtlMs = Math.max(5 * 60 * 1000, Number(process.env.PASSWORD_RESET_TTL_MS || 30 * 60 * 1000));
 
-const CERT_ABI = ["function authorizedIssuers(address issuer) view returns (bool)"];
+const CERT_ABI = [
+  "function authorizedIssuers(address issuer) view returns (bool)",
+  "function getCertificate(string certId) view returns (string metadataCid, string fileCid, bytes32 fileHash, address issuer, uint256 version, string replacesCertId, uint256 issuedAt, bool revoked, bool exists)",
+];
 const walletNonceByKey = new Map<string, { nonce: string; expiresAt: number }>();
 const failedLoginByEmail = new Map<string, { failCount: number; firstFailedAt: number; lastFailedAt: number; lockedUntil: number }>();
 const emailSendQueue = new Map<
@@ -370,6 +388,12 @@ async function db<T>(o: { method: "GET" | "POST" | "PATCH" | "DELETE"; table: st
   return r.data;
 }
 
+function isMissingPrivateAccessTableError(err: unknown): boolean {
+  const status = Number((err as any)?.response?.status || 0);
+  const url = String((err as any)?.config?.url || "");
+  return status === 404 && url.includes("/certificate_private_access");
+}
+
 async function audit(input: { actorUserId?: string | null; actorWallet?: string | null; action: string; entityType: string; entityId?: string | null; metadata?: Record<string, unknown> }): Promise<void> {
   try {
     await db({
@@ -389,6 +413,14 @@ function sha256(v: string): string {
 
 function normalizeCertId(value: unknown): string {
   return String(value ?? "").trim().toLowerCase();
+}
+
+function canonicalizeDemoCertId(certId: string): string {
+  const normalized = normalizeCertId(certId);
+  const match = normalized.match(/^demo-cert-(\d+)$/);
+  if (!match) return normalized;
+  const padded = String(match[1]).padStart(3, "0");
+  return `demo-cert-${padded}`;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -579,6 +611,87 @@ async function institutionCtx(userId: string): Promise<{ institution: Institutio
   if (!i) return null;
   const binds = await db<WalletBinding[]>({ method: "GET", table: "wallet_bindings", params: { select: "*", institution_id: `eq.${i.id}`, verified: "eq.true", order: "verified_at.desc", limit: "1" } });
   return { institution: i, mapping: m, binding: binds[0] || null };
+}
+
+async function certificatePrivateAccessByCertId(certId: string): Promise<CertificatePrivateAccess | null> {
+  const normalizedCertId = normalizeCertId(certId);
+  if (!normalizedCertId) return null;
+  try {
+    const rows = await db<CertificatePrivateAccess[]>({
+      method: "GET",
+      table: "certificate_private_access",
+      params: {
+        select: "*",
+        cert_id: `eq.${normalizedCertId}`,
+        limit: "1",
+      },
+    });
+    return rows[0] || null;
+  } catch (err) {
+    if (isMissingPrivateAccessTableError(err)) {
+      logEvent("warn", "certificate_private_access_table_missing", {
+        certId: normalizedCertId,
+      });
+      return null;
+    }
+    throw err;
+  }
+}
+
+export async function persistCertificatePrivateAccess(
+  input: CertificatePrivateAccessInput
+): Promise<boolean> {
+  const row = toCertificatePrivateAccessRow(input);
+  try {
+    await db({
+      method: "POST",
+      table: "certificate_private_access",
+      params: { on_conflict: "cert_id" },
+      body: [row],
+      prefer: "resolution=merge-duplicates,return=minimal",
+    });
+    return true;
+  } catch (err) {
+    if (isMissingPrivateAccessTableError(err)) {
+      logEvent("warn", "certificate_private_access_table_missing", {
+        certId: row.cert_id,
+        institutionId: row.institution_id || null,
+      });
+      return false;
+    }
+    throw err;
+  }
+}
+
+function loadFileEncryptionKey(): Buffer {
+  return decodeFileEncryptionKey(String(process.env.FILE_ENCRYPTION_KEY || ""));
+}
+
+function buildCertificateDownloadFilename(
+  certId: string,
+  accessRow: CertificatePrivateAccess | null
+): string {
+  const sourceName = String(accessRow?.source_file_name || "").trim();
+  const title = String(accessRow?.title || "").trim();
+  const base =
+    (sourceName ? path.parse(sourceName).name : "") ||
+    title ||
+    certId;
+  return `${sanitizeDownloadFilename(base, certId)}.pdf`;
+}
+
+function isEncryptedFileEnvelope(buffer: Buffer): boolean {
+  return buffer.length >= ENCRYPTED_FILE_MAGIC.length
+    && buffer.subarray(0, ENCRYPTED_FILE_MAGIC.length).equals(ENCRYPTED_FILE_MAGIC);
+}
+
+function looksLikePdf(buffer: Buffer): boolean {
+  return buffer.length >= 5 && buffer.subarray(0, 5).toString("utf8") === "%PDF-";
+}
+
+function isCertificateNotFoundError(err: unknown): boolean {
+  const message = String((err as any)?.shortMessage || (err as any)?.message || err || "").toLowerCase();
+  return message.includes("certificate not found");
 }
 
 async function onchainAuthorized(wallet: string): Promise<boolean> {
@@ -1281,8 +1394,229 @@ export function registerSecurityRoutes(app: express.Express, authLimiter: expres
       await audit({ actorUserId: req.auth?.userId || null, actorWallet: String(req.body?.connectedWallet || "").toLowerCase() || null, action: "CERT_ISSUE_ATTEMPT_FAILED", entityType: "certificate", entityId: normalizeCertId(req.body?.certId), metadata: { reason: "GATE_CHECK_FAILED" } });
       return;
     }
-    await audit({ actorUserId: gate.user.id, actorWallet: gate.wallet, action: "CERT_ISSUE_ATTEMPT_ALLOWED", entityType: "certificate", entityId: normalizeCertId(req.body?.certId), metadata: { txHash: String(req.body?.txHash || "") || null, metadataCid: String(req.body?.metadataCid || "") || null, fileCid: String(req.body?.fileCid || "") || null } });
-    return res.json({ ok: true, allowed: true, mode: "wallet-native", message: "Authorized. Submit issue tx via MetaMask." });
+    const certId = normalizeCertId(req.body?.certId);
+    const txHash = String(req.body?.txHash || "").trim() || null;
+    const metadataCid = String(req.body?.metadataCid || "").trim() || null;
+    const fileCid = String(req.body?.fileCid || "").trim() || null;
+    const title = String(req.body?.title || "").trim() || null;
+    const recipientName = String(req.body?.recipient || "").trim() || null;
+    const recipientEmail = normalizeEmail(req.body?.recipientEmail) || null;
+    const sourceFileName = String(req.body?.sourceFileName || "").trim() || null;
+    const sourceFileType = String(req.body?.sourceFileType || "").trim() || null;
+    const shouldPersistPrivateAccess = Boolean(certId && (txHash || metadataCid || fileCid || recipientEmail));
+    let privateAccessStored = false;
+
+    if (shouldPersistPrivateAccess) {
+      privateAccessStored = await persistCertificatePrivateAccess({
+        certId,
+        institutionId: gate.institution.id,
+        issuerWallet: gate.wallet,
+        title,
+        recipientName,
+        recipientEmail,
+        metadataCid,
+        fileCid,
+        issueTx: txHash,
+        sourceFileName,
+        sourceFileType,
+        issuedByUserId: gate.user.id,
+      });
+    }
+
+    await audit({
+      actorUserId: gate.user.id,
+      actorWallet: gate.wallet,
+      action: "CERT_ISSUE_ATTEMPT_ALLOWED",
+      entityType: "certificate",
+      entityId: certId,
+      metadata: {
+        txHash,
+        metadataCid,
+        fileCid,
+        recipientEmail,
+        privateAccessStored,
+      },
+    });
+    return res.json({
+      ok: true,
+      allowed: true,
+      mode: "wallet-native",
+      message: "Authorized. Submit issue tx via MetaMask.",
+      privateAccessStored,
+    });
+  });
+
+  app.get("/api/certificates/:certId/download", auth, roles("MOE_ADMIN", "INSTITUTION_ADMIN", "INDIVIDUAL"), async (req: AuthReq, res) => {
+    const requestedCertId = normalizeCertId(req.params.certId);
+    if (!requestedCertId) {
+      return res.status(400).json({ error: "certId is required" });
+    }
+    const certIdCandidates = Array.from(
+      new Set([requestedCertId, canonicalizeDemoCertId(requestedCertId)])
+    );
+
+    let certId = requestedCertId;
+
+    let accessRow: CertificatePrivateAccess | null = null;
+    let actorWallet: string | null = null;
+
+    try {
+      const user = await userById(req.auth!.userId);
+      if (!user) {
+        return res.status(401).json({ error: "User not found" });
+      }
+
+      const contractAddress = resolveContractAddress();
+      if (!contractAddress) {
+        return res.status(500).json({ error: "Certificate registry address is not configured" });
+      }
+      const provider = new JsonRpcProvider(resolveRpcUrl());
+      const contract = new Contract(contractAddress, CERT_ABI, provider);
+
+      let chainTuple:
+        | [string, string, string, string, bigint, string, bigint, boolean, boolean]
+        | null = null;
+      let lastErr: unknown = null;
+      for (const candidate of certIdCandidates) {
+        accessRow = await certificatePrivateAccessByCertId(candidate);
+        try {
+          chainTuple = (await contract.getFunction("getCertificate").staticCall(candidate)) as [
+            string,
+            string,
+            string,
+            string,
+            bigint,
+            string,
+            bigint,
+            boolean,
+            boolean,
+          ];
+          if (!chainTuple || !chainTuple[8]) {
+            chainTuple = null;
+            continue;
+          }
+          certId = candidate;
+          break;
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+      if (!chainTuple) {
+        if (lastErr && !isCertificateNotFoundError(lastErr)) {
+          throw lastErr;
+        }
+        return res.status(404).json({ error: "Certificate not found", certId: requestedCertId });
+      }
+
+      const [, fileCidOnChain, onChainHash, issuer] = chainTuple;
+      const issuerWallet = String(issuer || "").trim().toLowerCase();
+      const resolvedFileCid = String(fileCidOnChain || accessRow?.file_cid || "").trim();
+      if (!resolvedFileCid) {
+        return res.status(422).json({ error: "Certificate file CID is missing", certId });
+      }
+
+      if (req.auth!.role === "INSTITUTION_ADMIN") {
+        const ctx = await institutionCtx(user.id);
+        if (!ctx) {
+          return res.status(403).json({ error: "No institution mapping" });
+        }
+        if (ctx.institution.status !== "ACTIVE") {
+          return res.status(403).json({ error: "Institution not ACTIVE" });
+        }
+        actorWallet = String(ctx.binding?.wallet_address || ctx.institution.issuer_wallet || "").trim().toLowerCase() || null;
+        const institutionMatches =
+          Boolean(accessRow?.institution_id) && accessRow!.institution_id === ctx.institution.id;
+        const issuerMatches = Boolean(issuerWallet) && issuerWallet === ctx.institution.issuer_wallet.toLowerCase();
+        if (!institutionMatches && !issuerMatches) {
+          await audit({
+            actorUserId: user.id,
+            actorWallet,
+            action: "CERT_DOWNLOAD_DENIED",
+            entityType: "certificate",
+            entityId: certId,
+            metadata: { role: user.role, reason: "INSTITUTION_SCOPE_MISMATCH" },
+          });
+          return res.status(403).json({ error: "You are not allowed to download this certificate" });
+        }
+      } else if (req.auth!.role === "INDIVIDUAL") {
+        if (!accessRow?.recipient_email) {
+          await audit({
+            actorUserId: user.id,
+            action: "CERT_DOWNLOAD_DENIED",
+            entityType: "certificate",
+            entityId: certId,
+            metadata: { role: user.role, reason: "RECIPIENT_EMAIL_NOT_LINKED" },
+          });
+          return res.status(403).json({
+            error: "This certificate is not linked to a student email yet. Ask the issuer or MoE to backfill recipientEmail for this certificate.",
+          });
+        }
+        if (!canRecipientAccessCertificate(user.email, accessRow)) {
+          await audit({
+            actorUserId: user.id,
+            action: "CERT_DOWNLOAD_DENIED",
+            entityType: "certificate",
+            entityId: certId,
+            metadata: { role: user.role, reason: "RECIPIENT_EMAIL_MISMATCH" },
+          });
+          return res.status(403).json({
+            error: "This certificate is linked to a different student email address.",
+          });
+        }
+      }
+
+      const encryptedBytes = await fetchCidBytes(resolvedFileCid);
+      const computedHash = sha256Hex0x(encryptedBytes);
+      if (computedHash.toLowerCase() !== String(onChainHash || "").toLowerCase()) {
+        return res.status(409).json({
+          error: "Certificate file integrity mismatch",
+          certId,
+        });
+      }
+
+      const decryptedBytes = isEncryptedFileEnvelope(encryptedBytes)
+        ? decryptPinnedFileWithKey(encryptedBytes, loadFileEncryptionKey())
+        : looksLikePdf(encryptedBytes)
+          ? encryptedBytes
+          : (() => {
+              throw new Error("Certificate file is neither an encrypted envelope nor a PDF");
+            })();
+      const filename = buildCertificateDownloadFilename(certId, accessRow);
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+      res.setHeader("Cache-Control", "private, no-store, max-age=0");
+      res.setHeader("X-Content-Type-Options", "nosniff");
+
+      await audit({
+        actorUserId: user.id,
+        actorWallet,
+        action: "CERT_DOWNLOAD_ALLOWED",
+        entityType: "certificate",
+        entityId: certId,
+        metadata: {
+          role: user.role,
+          issuerWallet,
+          fileCid: resolvedFileCid,
+        },
+      });
+      return res.send(decryptedBytes);
+    } catch (e: any) {
+      logEvent("error", "certificate_download_failed", {
+        certId,
+        userId: req.auth?.userId || null,
+        role: req.auth?.role || null,
+        error: e?.message || String(e),
+      });
+      await audit({
+        actorUserId: req.auth?.userId || null,
+        actorWallet,
+        action: "CERT_DOWNLOAD_FAILED",
+        entityType: "certificate",
+        entityId: certId,
+        metadata: { error: e?.message || String(e) },
+      });
+      return res.status(500).json({ error: "Secure certificate download failed", message: e?.message || String(e) });
+    }
   });
 
   app.post("/api/certificates/revoke", auth, roles("INSTITUTION_ADMIN"), async (req: AuthReq, res) => {

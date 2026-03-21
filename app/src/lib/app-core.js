@@ -65,7 +65,8 @@ export async function apiJson(url, options = {}) {
   if (!response.ok) {
     const parsedError = String(parsed.error || "").trim();
     const parsedMessage = String(parsed.message || "").trim();
-    throw new Error(parsedError || parsedMessage || `HTTP ${response.status}`);
+    const parsedDetails = String(parsed.details || "").trim();
+    throw new Error(parsedMessage || parsedDetails || parsedError || `HTTP ${response.status}`);
   }
 
   return parsed;

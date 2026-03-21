@@ -30,7 +30,11 @@ import {
   sha256Hex0x,
 } from "./ipfs-client.js";
 import { embedVerificationMetadataInPdf } from "./pdf-verification.js";
-import { institutionPinGuard, registerSecurityRoutes } from "./security.js";
+import {
+  institutionPinGuard,
+  persistCertificatePrivateAccess,
+  registerSecurityRoutes,
+} from "./security.js";
 import {
   createRequestLoggingMiddleware,
   getPreferredLanIpv4,
@@ -2135,6 +2139,7 @@ app.post("/api/pin", ...institutionPinGuard(authRateLimiter), pinRateLimiter, up
     const certId = normalizeCertId(req.body?.certId);
     const title = String(req.body?.title || "").trim();
     const recipient = String(req.body?.recipient || "").trim();
+    const recipientEmail = String(req.body?.recipientEmail || "").trim().toLowerCase();
     const institutionName = String(req.body?.institutionName || "").trim();
     const replacesCertId = normalizeCertId(req.body?.replacesCertId);
     const versionRaw = Number(req.body?.version);
@@ -2212,6 +2217,7 @@ app.post("/api/pin", ...institutionPinGuard(authRateLimiter), pinRateLimiter, up
       encryptedBlob,
       title,
       recipient,
+      recipientEmail,
       institutionName,
       sourceFileName: req.file.originalname,
       sourceFileType: req.file.mimetype,
@@ -2278,9 +2284,18 @@ app.post("/api/pin", ...institutionPinGuard(authRateLimiter), pinRateLimiter, up
 
 
 app.get("/api/fetch/:cid", async (req, res) => {
+  const cid = String(req.params.cid || "").trim();
+  if (!cid || cid.toLowerCase() === "undefined" || cid.toLowerCase() === "null") {
+    return res.status(410).json({
+      error: "Legacy download link is stale",
+      message:
+        "Refresh the frontend and use the authenticated 'Download Original PDF' button on the certificate page.",
+    });
+  }
   return res.status(403).json({
     error: "Raw file download is disabled on the public API",
-    message: "Use an authenticated issuer workflow to access certificate files.",
+    message:
+      "Use the authenticated 'Download Original PDF' workflow from the certificate page instead.",
   });
 });
 
@@ -2923,7 +2938,13 @@ app.get("/api/certificates/:certId/history", async (req, res) => {
  *   version?: number, // default 1 for new cert
  *   replacesCertId?: string, // required when version > 1
  *   metadata?: object, // optional extra fields merged into pinned metadata JSON
- *   metadataCid?: string // optional pre-pinned metadata CID
+ *   metadataCid?: string, // optional pre-pinned metadata CID
+ *   title?: string,
+ *   recipient?: string,
+ *   recipientEmail?: string,
+ *   institutionName?: string,
+ *   sourceFileName?: string,
+ *   sourceFileType?: string
  * }
  *
  * Optional header: Idempotency-Key: <unique-client-key>
@@ -3093,6 +3114,10 @@ app.post("/api/issue", async (req, res) => {
 
     let metadataCid = providedMetadataCid;
     let pinnedMetadata: PinnedMetadata | null = null;
+    const metadataObject =
+      metadataInput && typeof metadataInput === "object" && !Array.isArray(metadataInput)
+        ? (metadataInput as Record<string, unknown>)
+        : null;
 
     if (!metadataCid) {
       if (!pinJwt) {
@@ -3129,6 +3154,33 @@ app.post("/api/issue", async (req, res) => {
       replacesCertId
     );
     const receipt = await tx.wait();
+    let privateAccessStored = false;
+    try {
+      const title = String(req.body?.title ?? metadataObject?.title ?? "").trim();
+      const recipientName = String(req.body?.recipient ?? metadataObject?.recipient ?? "").trim();
+      const recipientEmail = String(req.body?.recipientEmail ?? metadataObject?.recipientEmail ?? "").trim();
+      const sourceFileName = String(req.body?.sourceFileName || "").trim();
+      const sourceFileType = String(req.body?.sourceFileType || "").trim();
+      if (title || recipientName || recipientEmail || sourceFileName || sourceFileType) {
+        privateAccessStored = await persistCertificatePrivateAccess({
+          certId,
+          issuerWallet: signer.address,
+          title,
+          recipientName,
+          recipientEmail,
+          metadataCid,
+          fileCid,
+          issueTx: receipt?.hash ?? tx.hash,
+          sourceFileName,
+          sourceFileType,
+        });
+      }
+    } catch (persistErr: any) {
+      console.error(
+        "Private certificate access persistence failed:",
+        persistErr?.message || String(persistErr)
+      );
+    }
 
     return respondIssue(200, {
       ok: true,
@@ -3142,6 +3194,7 @@ app.post("/api/issue", async (req, res) => {
       issuer: signer.address,
       txHash: receipt?.hash ?? tx.hash,
       blockNumber: receipt?.blockNumber ?? null,
+      privateAccessStored,
     });
   } catch (err: any) {
     if (issueIdempotency) {

@@ -9,7 +9,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "lint": "npm run typecheck",
     "test": "npm run test:unit",
-    "test:unit": "tsx ./test/file-envelope.unit.ts",
+    "test:unit": "tsx ./test/file-envelope.unit.ts && tsx ./test/certificate-private-access.unit.ts",
     "test:integration": "npm run test:auth-smoke && npm run test:authz-regression",
     "test:auth-smoke": "tsx ./test/auth-routes.smoke.ts",
     "test:authz-regression": "tsx ./test/authz-regression.smoke.ts",

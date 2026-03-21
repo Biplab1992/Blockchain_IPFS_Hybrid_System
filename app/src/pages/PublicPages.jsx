@@ -9,9 +9,10 @@ import {
   normalizeCertId,
 } from "../lib/app-core";
 
-export function VerifyPage({ fixedCertId = "", profileMode = false }) {
+export function VerifyPage({ fixedCertId = "", profileMode = false, session = null, authDownload = null }) {
   const [certId, setCertId] = useState("");
   const [loading, setLoading] = useState(false);
+  const [downloadLoading, setDownloadLoading] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState(null);
   const [history, setHistory] = useState(null);
@@ -82,6 +83,22 @@ export function VerifyPage({ fixedCertId = "", profileMode = false }) {
     if (!result?.certId) return;
     const url = `${API_BASE}/api/proof/${encodeURIComponent(result.certId)}.pdf`;
     window.open(url, "_blank", "noopener,noreferrer");
+  }
+
+  async function downloadOriginalPdf() {
+    if (!result?.certId || !authDownload) return;
+    setError("");
+    setDownloadLoading(true);
+    try {
+      await authDownload(
+        `/api/certificates/${encodeURIComponent(result.certId)}/download`,
+        `${result.certId}.pdf`
+      );
+    } catch (downloadError) {
+      setError(downloadError.message || String(downloadError));
+    } finally {
+      setDownloadLoading(false);
+    }
   }
 
   const statusClass =
@@ -163,10 +180,20 @@ export function VerifyPage({ fixedCertId = "", profileMode = false }) {
           <p><strong>Replaces:</strong> {String(result.replacesCertId || "-")}</p>
           <p><strong>Integrity Match:</strong> {String(result.integrityMatch)}</p>
           <p><strong>Revoked:</strong> {String(result.revoked)}</p>
-          <p className="sub">Public verification hides recipient details and raw certificate downloads.</p>
+          <p className="sub">
+            Public verification hides recipient details.
+            {session?.accessToken
+              ? " Authorized users can download the original PDF."
+              : " Sign in as an authorized user to download the original PDF."}
+          </p>
           <div className="action-row">
             <button type="button" onClick={downloadProofJson}>Download Proof JSON</button>
             <button type="button" onClick={downloadProofPdf}>Download Proof PDF</button>
+            {session?.accessToken && authDownload ? (
+              <button type="button" onClick={downloadOriginalPdf} disabled={downloadLoading}>
+                {downloadLoading ? "Downloading..." : "Download Original PDF"}
+              </button>
+            ) : null}
             {issuer ? <Link to={`/institutions/${encodeURIComponent(issuer)}`}>Institution Page</Link> : null}
           </div>
         </div>
@@ -217,10 +244,10 @@ export function VerifyPage({ fixedCertId = "", profileMode = false }) {
   );
 }
 
-export function CertificateProfilePage() {
+export function CertificateProfilePage({ session = null, authDownload = null }) {
   const params = useParams();
   const certId = normalizeCertId(params.certId || "");
-  return <VerifyPage fixedCertId={certId} profileMode />;
+  return <VerifyPage fixedCertId={certId} profileMode session={session} authDownload={authDownload} />;
 }
 
 export function InstitutionPublicPage() {

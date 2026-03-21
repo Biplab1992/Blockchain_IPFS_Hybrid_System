@@ -23,6 +23,79 @@ import {
 } from "./lib/app-core";
 import { CertificateProfilePage, InstitutionPublicPage, VerifyPage } from "./pages/PublicPages";
 
+const ISSUER_STATUS_CACHE_KEY = "certchain_issuer_status_v1";
+const ISSUER_STATUS_CACHE_TTL_MS = 10 * 60 * 1000;
+
+function loadIssuerStatusCache() {
+  try {
+    return JSON.parse(localStorage.getItem(ISSUER_STATUS_CACHE_KEY) || "{}");
+  } catch {
+    return {};
+  }
+}
+
+function readCachedIssuerStatus(wallet) {
+  const key = String(wallet || "").trim().toLowerCase();
+  if (!key) return null;
+  const cache = loadIssuerStatusCache();
+  const entry = cache?.[key];
+  if (!entry || typeof entry !== "object") return null;
+  const updatedAt = Number(entry.updatedAt || 0);
+  if (!updatedAt || Date.now() - updatedAt > ISSUER_STATUS_CACHE_TTL_MS) return null;
+  return {
+    authorized: entry.authorized === true,
+    source: String(entry.source || "").trim() || "cached",
+    updatedAt,
+  };
+}
+
+function writeCachedIssuerStatus(wallet, authorized, source = "live") {
+  const key = String(wallet || "").trim().toLowerCase();
+  if (!key) return;
+  const cache = loadIssuerStatusCache();
+  cache[key] = {
+    authorized: authorized === true,
+    source: String(source || "").trim() || "live",
+    updatedAt: Date.now(),
+  };
+  localStorage.setItem(ISSUER_STATUS_CACHE_KEY, JSON.stringify(cache));
+}
+
+function deriveIssuerAuthorization(issuerStatus, cachedStatus = null) {
+  const onChainAuthorized =
+    typeof issuerStatus?.onChainAuthorized === "boolean"
+      ? issuerStatus.onChainAuthorized
+      : null;
+  const indexedAuthorized =
+    typeof issuerStatus?.indexedAuthorized === "boolean"
+      ? issuerStatus.indexedAuthorized
+      : null;
+
+  if (onChainAuthorized === true) {
+    return { authorized: true, source: "on-chain" };
+  }
+  if (indexedAuthorized === true) {
+    return { authorized: true, source: "indexed" };
+  }
+  if (
+    cachedStatus?.authorized === true &&
+    onChainAuthorized === false &&
+    (issuerStatus?.indexerSyncRunning || indexedAuthorized === null)
+  ) {
+    return { authorized: true, source: "cached" };
+  }
+  if (onChainAuthorized === false) {
+    return { authorized: false, source: "on-chain" };
+  }
+  if (indexedAuthorized === false) {
+    return { authorized: false, source: "indexed" };
+  }
+  if (cachedStatus?.authorized === true) {
+    return { authorized: true, source: "cached" };
+  }
+  return { authorized: null, source: "" };
+}
+
 async function ensureCorrectWalletNetwork() {
   if (!window.ethereum) {
     throw new Error("Wallet not found. Install MetaMask.");
@@ -147,6 +220,59 @@ function App() {
         Authorization: `Bearer ${nextAccessToken}`,
       };
       return apiJson(`${API_BASE}${path}`, { ...options, headers: retryHeaders });
+    }
+  }
+
+  async function authDownloadWithToken(path, fallbackFilename, accessToken) {
+    const response = await fetch(`${API_BASE}${path}`, {
+      credentials: "include",
+      headers: {
+        Authorization: `Bearer ${accessToken || ""}`,
+      },
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      let parsed = {};
+      if (text) {
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          parsed = { message: text };
+        }
+      }
+      const parsedError = String(parsed.error || "").trim();
+      const parsedMessage = String(parsed.message || "").trim();
+      const message =
+        (parsedError === "Secure certificate download failed" && parsedMessage
+          ? parsedMessage
+          : parsedError || parsedMessage) ||
+        `HTTP ${response.status}`;
+      throw new Error(message);
+    }
+    const blob = await response.blob();
+    const disposition = String(response.headers.get("content-disposition") || "");
+    const match = disposition.match(/filename="?([^";]+)"?/i);
+    const filename = String(match?.[1] || fallbackFilename || "certificate.pdf").trim() || "certificate.pdf";
+    const objectUrl = window.URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.URL.revokeObjectURL(objectUrl);
+    return { ok: true, filename };
+  }
+
+  async function authDownload(path, fallbackFilename, retried = false) {
+    try {
+      return await authDownloadWithToken(path, fallbackFilename, session?.accessToken || "");
+    } catch (err) {
+      const msg = String(err?.message || "").toLowerCase();
+      const shouldTryRefresh = !retried && (msg.includes("http 401") || msg.includes("invalid/expired access token"));
+      if (!shouldTryRefresh) throw err;
+      const nextAccessToken = await refreshAccessToken();
+      return authDownloadWithToken(path, fallbackFilename, nextAccessToken);
     }
   }
 
@@ -286,8 +412,8 @@ function App() {
         <Routes>
           <Route path="/" element={isLoggedIn ? <Navigate to="/verify" replace /> : <HomePage />} />
           <Route path="/scan" element={<Navigate to="/verify" replace />} />
-          <Route path="/verify" element={<VerifyPage />} />
-          <Route path="/certificate/:certId" element={<CertificateProfilePage />} />
+          <Route path="/verify" element={<VerifyPage session={session} authDownload={authDownload} />} />
+          <Route path="/certificate/:certId" element={<CertificateProfilePage session={session} authDownload={authDownload} />} />
           <Route path="/institutions/:issuer" element={<InstitutionPublicPage />} />
           <Route path="/login" element={<LoginPage setSession={setSession} />} />
           <Route path="/forgot-password" element={<ForgotPasswordPage showToast={showToast} />} />
@@ -640,6 +766,10 @@ function IndividualProfilePage({ session }) {
       <div className="result">
         <p><strong>Email:</strong> {String(session?.user?.email || "").trim() || "-"}</p>
         <p><strong>Role:</strong> {String(session?.user?.role || "").trim() || "-"}</p>
+      </div>
+      <div className="result">
+        <h2>Secure Certificate Downloads</h2>
+        <p className="sub">Use the Verify page to open a certificate profile, then download the original PDF when the issuing institution linked that certificate to your account email.</p>
       </div>
       <div className="result">
         <h2>Security</h2>
@@ -1114,8 +1244,10 @@ function MoeInstitutionsPage({ authApi, showToast, ensureWallet }) {
 function InstitutionPage({ authApi, session, ensureWallet, showToast }) {
   const [profile, setProfile] = useState(null);
   const [error, setError] = useState("");
-  const [issuerAuthorized, setIssuerAuthorized] = useState(false);
+  const [issuerAuthorized, setIssuerAuthorized] = useState(null);
   const [issuerStatusDetails, setIssuerStatusDetails] = useState(null);
+  const [issuerStatusError, setIssuerStatusError] = useState("");
+  const [issuerStatusSource, setIssuerStatusSource] = useState("");
   const [issuedTotal, setIssuedTotal] = useState(0);
   const [latestAuthRequest, setLatestAuthRequest] = useState(null);
   const [requestAuthorizeNote, setRequestAuthorizeNote] = useState("");
@@ -1131,25 +1263,64 @@ function InstitutionPage({ authApi, session, ensureWallet, showToast }) {
   const isInstitutionAdmin = role === "INSTITUTION_ADMIN";
 
   useEffect(() => {
+    let cancelled = false;
+
+    async function fetchIssuerStatusWithRetry(wallet, attempts = 3) {
+      let lastError = null;
+      for (let attempt = 0; attempt < attempts; attempt += 1) {
+        try {
+          return await authApi(`/api/issuers/${encodeURIComponent(wallet)}/status`);
+        } catch (err) {
+          lastError = err;
+          if (attempt < attempts - 1) {
+            await new Promise((resolve) => setTimeout(resolve, 1200 * (attempt + 1)));
+          }
+        }
+      }
+      throw lastError || new Error("Issuer status lookup failed");
+    }
+
     if (isInstitutionAdmin) {
       void authApi("/api/institution/profile")
         .then(async (p) => {
+          if (cancelled) return;
           setProfile(p);
           const wallet = String(p?.institution?.issuerWallet || "").trim().toLowerCase();
+          const cachedIssuerStatus = readCachedIssuerStatus(wallet);
+          if (cachedIssuerStatus) {
+            setIssuerAuthorized(cachedIssuerStatus.authorized);
+            setIssuerStatusSource(cachedIssuerStatus.source);
+          } else {
+            setIssuerAuthorized(null);
+            setIssuerStatusSource("");
+          }
           const institutionName = String(p?.institution?.name || "").trim().toLowerCase();
           const [issuerStatusResult, certRowsResult, latestRequestResult] = await Promise.allSettled([
-            wallet ? authApi(`/api/issuers/${encodeURIComponent(wallet)}/status`) : Promise.resolve({ onChainAuthorized: false }),
+            wallet
+              ? fetchIssuerStatusWithRetry(wallet)
+              : Promise.resolve({ onChainAuthorized: null, indexedAuthorized: null }),
             wallet ? listAllCertificatesByIssuer(authApi, wallet) : Promise.resolve([]),
             authApi("/api/institution/authorization-requests/latest").catch(() => ({ request: null })),
           ]);
+          if (cancelled) return;
 
           if (issuerStatusResult.status === "fulfilled") {
             const issuerStatus = issuerStatusResult.value;
-            setIssuerAuthorized(Boolean(issuerStatus?.onChainAuthorized));
+            const derivedIssuerStatus = deriveIssuerAuthorization(issuerStatus, cachedIssuerStatus);
+            setIssuerAuthorized(derivedIssuerStatus.authorized);
             setIssuerStatusDetails(issuerStatus || null);
+            setIssuerStatusSource(derivedIssuerStatus.source);
+            if (derivedIssuerStatus.authorized !== null) {
+              writeCachedIssuerStatus(wallet, derivedIssuerStatus.authorized, derivedIssuerStatus.source);
+            }
+            setIssuerStatusError("");
           } else {
-            setIssuerAuthorized(false);
+            if (!cachedIssuerStatus) {
+              setIssuerAuthorized(null);
+              setIssuerStatusSource("");
+            }
             setIssuerStatusDetails(null);
+            setIssuerStatusError(normalizeUserFacingError(issuerStatusResult.reason));
           }
 
           if (latestRequestResult.status === "fulfilled") {
@@ -1176,11 +1347,15 @@ function InstitutionPage({ authApi, session, ensureWallet, showToast }) {
             setIssuedTotal(0);
           }
         })
-        .catch((err) => setError(normalizeUserFacingError(err)));
+        .catch((err) => {
+          if (cancelled) return;
+          setError(normalizeUserFacingError(err));
+        });
     }
     if (isMoe) {
       void authApi("/api/moe/institutions")
         .then((r) => {
+          if (cancelled) return;
           const rows = Array.isArray(r?.data) ? r.data : [];
           setMoeInstitutions(rows);
           if (rows[0]?.id) {
@@ -1188,17 +1363,42 @@ function InstitutionPage({ authApi, session, ensureWallet, showToast }) {
             setMoeIssuerWallet(String(rows[0].issuer_wallet || "").trim());
           }
         })
-        .catch((err) => setError(normalizeUserFacingError(err)));
+        .catch((err) => {
+          if (cancelled) return;
+          setError(normalizeUserFacingError(err));
+        });
     }
+
+    return () => {
+      cancelled = true;
+    };
   }, [isInstitutionAdmin, isMoe]);
 
   const isBound = Boolean(profile?.binding?.verified);
   const boundAddress = String(profile?.binding?.walletAddress || "").trim();
   const status = String(profile?.institution?.status || "").trim();
+  const issuerAuthorizationLabel =
+    issuerAuthorized === true
+      ? "On-chain authorized"
+      : issuerAuthorized === false
+        ? "Not authorized"
+        : "Status unavailable";
+  const issuerAuthorizationText =
+    issuerAuthorized === true
+      ? "Authorized"
+      : issuerAuthorized === false
+        ? "Not authorized"
+        : "Unavailable";
+  const issuerAuthorizationSourceNote =
+    issuerAuthorized === true && issuerStatusSource === "indexed"
+      ? "Using indexed authorization while the live wallet check catches up."
+      : issuerAuthorized === true && issuerStatusSource === "cached"
+        ? "Using the last confirmed authorization status while refreshing."
+        : "";
   const checklist = [
     { label: "Activate", done: status === "ACTIVE", helper: status || "PENDING" },
     { label: "Bind Wallet", done: isBound, helper: boundAddress || "Not bound" },
-    { label: "Authorize", done: issuerAuthorized, helper: issuerAuthorized ? "On-chain authorized" : "Not authorized" },
+    { label: "Authorize", done: issuerAuthorized === true, helper: issuerAuthorizationLabel },
     { label: "Issue", done: issuedTotal > 0, helper: issuedTotal > 0 ? `${issuedTotal} cert(s) issued` : "No certificates issued yet" },
   ];
 
@@ -1275,12 +1475,14 @@ function InstitutionPage({ authApi, session, ensureWallet, showToast }) {
         <p><strong>Status:</strong> {status || "-"}</p>
         <p><strong>Wallet status:</strong> {isBound ? "Bound" : "Not bound"}</p>
         {isBound ? <p><strong>Bound address:</strong> {boundAddress || "-"}</p> : null}
-        <p><strong>Issuer authorization:</strong> {issuerAuthorized ? "Authorized" : "Not authorized"}</p>
+        <p><strong>Issuer authorization:</strong> {issuerAuthorizationText}</p>
         {issuerStatusDetails ? (
           <p className="sub">
             On-chain: {String(Boolean(issuerStatusDetails?.onChainAuthorized))} | Indexed: {issuerStatusDetails?.indexedAuthorized === null ? "n/a" : String(Boolean(issuerStatusDetails?.indexedAuthorized))}
           </p>
         ) : null}
+        {issuerAuthorizationSourceNote ? <p className="sub">{issuerAuthorizationSourceNote}</p> : null}
+        {issuerStatusError ? <p className="sub">Authorization status check failed: {issuerStatusError}</p> : null}
         <p><strong>Total issued certificates:</strong> {issuedTotal}</p>
       </div>
       {isInstitutionAdmin ? (
@@ -1300,7 +1502,7 @@ function InstitutionPage({ authApi, session, ensureWallet, showToast }) {
           ) : (
             <p><Link to="/issue">Continue: Issue Certificate</Link></p>
           )}
-          {!issuerAuthorized && isBound ? (
+          {issuerAuthorized === false && isBound ? (
             <>
               <hr className="section-divider" />
               <div className="title-row">
@@ -1347,6 +1549,11 @@ function InstitutionPage({ authApi, session, ensureWallet, showToast }) {
                 </button>
               </div>
             </>
+          ) : null}
+          {issuerAuthorized === null && isBound ? (
+            <p className="sub">
+              Authorization status is still being confirmed. If the backend just restarted, wait a moment and refresh this page.
+            </p>
           ) : null}
           <hr className="section-divider" />
           <h2>Account Security</h2>
@@ -1468,13 +1675,12 @@ function IssuePage({ ensureWallet, session, authApi }) {
   const [certId, setCertId] = useState("");
   const [title, setTitle] = useState("");
   const [recipient, setRecipient] = useState("");
+  const [recipientEmail, setRecipientEmail] = useState("");
   const [institutionName, setInstitutionName] = useState("");
   const [version, setVersion] = useState(1);
   const [replacesCertId, setReplacesCertId] = useState("");
   const [file, setFile] = useState(null);
   const [loading, setLoading] = useState(false);
-  const [pinLoading, setPinLoading] = useState(false);
-  const [pinResult, setPinResult] = useState(null);
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
 
@@ -1500,6 +1706,7 @@ function IssuePage({ ensureWallet, session, authApi }) {
     form.append("certId", normalizedCertId);
     form.append("title", title);
     form.append("recipient", recipient);
+    form.append("recipientEmail", recipientEmail);
     form.append("institutionName", institutionName);
     form.append("version", String(version));
     form.append("replacesCertId", normalizedReplacesCertId);
@@ -1524,6 +1731,7 @@ function IssuePage({ ensureWallet, session, authApi }) {
       certId: normalizedCertId,
       title: String(pinResp?.metadata?.title || title || "").trim(),
       recipient: String(pinResp?.metadata?.recipient || recipient || "").trim(),
+      recipientEmail: String(pinResp?.metadata?.recipientEmail || recipientEmail || "").trim(),
       institutionName: String(pinResp?.metadata?.institutionName || institutionName || "").trim(),
       metadataCid,
       fileCid,
@@ -1533,26 +1741,7 @@ function IssuePage({ ensureWallet, session, authApi }) {
       pdfMetadataEmbedded: Boolean(pinResp.pdfMetadataEmbedded),
       metadata: pinResp?.metadata || null,
     };
-    setPinResult(nextPinResult);
     return nextPinResult;
-  }
-
-  async function onPinOnly() {
-    setError("");
-    setResult(null);
-    if (!session?.accessToken || session?.user?.role !== "INSTITUTION_ADMIN") {
-      setError("Institution login required for pinning.");
-      return;
-    }
-    setPinLoading(true);
-    try {
-      const { address } = await ensureWallet();
-      await pinCurrentFile(address);
-    } catch (pinError) {
-      setError(normalizeUserFacingError(pinError));
-    } finally {
-      setPinLoading(false);
-    }
   }
 
   async function onSubmit(event) {
@@ -1590,8 +1779,10 @@ function IssuePage({ ensureWallet, session, authApi }) {
         normalizedReplacesCertId
       );
       const receipt = await tx.wait();
+      let privateAccessStored = false;
+      let privateAccessWarning = "";
       try {
-        await authApi("/api/certificates/issue", {
+        const persistResp = await authApi("/api/certificates/issue", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -1600,10 +1791,17 @@ function IssuePage({ ensureWallet, session, authApi }) {
             fileCid,
             txHash: receipt?.hash || tx.hash,
             connectedWallet: address,
+            title: title.trim(),
+            recipient: recipient.trim(),
+            recipientEmail: recipientEmail.trim(),
+            institutionName: institutionName.trim(),
+            sourceFileName: file?.name || "",
+            sourceFileType: file?.type || "",
           }),
         });
-      } catch {
-        // Do not fail issuance UI if audit endpoint fails.
+        privateAccessStored = Boolean(persistResp?.privateAccessStored);
+      } catch (persistError) {
+        privateAccessWarning = normalizeUserFacingError(persistError);
       }
       let indexed = false;
       try {
@@ -1638,6 +1836,8 @@ function IssuePage({ ensureWallet, session, authApi }) {
         txHash: receipt?.hash || tx.hash,
         issuer: address,
         institutionName: pinned.institutionName,
+        privateAccessStored,
+        privateAccessWarning,
       });
     } catch (submitError) {
       setError(normalizeUserFacingError(submitError));
@@ -1669,9 +1869,19 @@ function IssuePage({ ensureWallet, session, authApi }) {
           <input value={title} onChange={(e) => setTitle(e.target.value)} />
         </label>
         <label>
-          Recipient
+          Recipient Name
           <input value={recipient} onChange={(e) => setRecipient(e.target.value)} />
         </label>
+        <label>
+          Recipient Email
+          <input
+            type="email"
+            value={recipientEmail}
+            onChange={(e) => setRecipientEmail(e.target.value)}
+            placeholder="student@example.com"
+          />
+        </label>
+        <p className="sub">Use the student account email here if the student should be able to download the original PDF securely.</p>
         <label>
           Institution Name
           <input value={institutionName} readOnly />
@@ -1695,37 +1905,13 @@ function IssuePage({ ensureWallet, session, authApi }) {
         </label>
 
         <div className="action-row">
-          <button type="button" className="secondary-button" disabled={loading || pinLoading} onClick={onPinOnly}>
-            {pinLoading ? "Pinning..." : "Pin Only"}
-          </button>
-          <button type="submit" disabled={loading || pinLoading}>
+          <button type="submit" disabled={loading}>
             {loading ? "Issuing..." : "Issue"}
           </button>
         </div>
       </form>
 
       {error ? <p className="error">{error}</p> : null}
-      {pinResult ? (
-        <div className="result">
-          <h2>Pinned To IPFS</h2>
-          <p><strong>certId:</strong> {pinResult.certId}</p>
-          <p><strong>title:</strong> {pinResult.title || "-"}</p>
-          <p><strong>recipient:</strong> {pinResult.recipient || "-"}</p>
-          <p><strong>institutionName:</strong> {pinResult.institutionName || "-"}</p>
-          <p><strong>metadataCid:</strong> {pinResult.metadataCid}</p>
-          <p><strong>fileCid:</strong> {pinResult.fileCid}</p>
-          <p><strong>fileHash:</strong> {pinResult.fileHash}</p>
-          <p><strong>sourceHash:</strong> {pinResult.sourceHash || "-"}</p>
-          <p><strong>PDF metadata embedded:</strong> {pinResult.pdfMetadataEmbedded ? "true" : "false"}</p>
-          <p>
-            <strong>Verify URL:</strong>{" "}
-            <a href={pinResult.verifyUrl} target="_blank" rel="noreferrer">
-              {pinResult.verifyUrl}
-            </a>
-          </p>
-          <pre>{JSON.stringify(pinResult.metadata || {}, null, 2)}</pre>
-        </div>
-      ) : null}
       {result ? (
         <div className="result">
           <h2>Issued</h2>
@@ -1736,6 +1922,7 @@ function IssuePage({ ensureWallet, session, authApi }) {
           <p><strong>fileCid:</strong> {result.fileCid}</p>
           <p><strong>fileHash:</strong> {result.fileHash}</p>
           <p><strong>Indexed to Supabase:</strong> {result.indexed ? "true" : "pending"}</p>
+          <p><strong>Secure download access saved:</strong> {result.privateAccessStored ? "true" : "false"}</p>
           <p><strong>txHash:</strong> {result.txHash}</p>
           <p>
             <strong>Verify URL:</strong>{" "}
@@ -1751,6 +1938,9 @@ function IssuePage({ ensureWallet, session, authApi }) {
             <img className="qr-image" src={result.qrCodeImageUrl} alt={`Verification QR for ${result.certId}`} />
             <p className="sub">Scan to open verification page with certId prefilled.</p>
           </div>
+          {result.privateAccessWarning ? (
+            <p className="error">Secure download access was not saved: {result.privateAccessWarning}</p>
+          ) : null}
         </div>
       ) : null}
     </section>

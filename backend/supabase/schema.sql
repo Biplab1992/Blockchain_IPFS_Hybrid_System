@@ -120,6 +120,23 @@ create table if not exists public.wallet_bindings (
   unique (institution_id, wallet_address)
 );
 
+create table if not exists public.certificate_private_access (
+  cert_id text primary key,
+  institution_id uuid null references public.institutions(id) on delete set null,
+  issuer_wallet text null,
+  title text null,
+  recipient_name text null,
+  recipient_email text null,
+  metadata_cid text null,
+  file_cid text null,
+  issue_tx text null,
+  source_file_name text null,
+  source_file_type text null,
+  issued_by_user_id uuid null references public.users(id) on delete set null,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
 create table if not exists public.refresh_tokens (
   id uuid primary key default gen_random_uuid(),
   user_id uuid not null references public.users(id) on delete cascade,
@@ -165,6 +182,9 @@ create index if not exists users_email_idx on public.users (email);
 create index if not exists institutions_status_idx on public.institutions (status);
 create index if not exists invitations_token_hash_idx on public.invitations (token_hash);
 create index if not exists wallet_bindings_inst_idx on public.wallet_bindings (institution_id);
+create index if not exists certificate_private_access_institution_idx on public.certificate_private_access (institution_id);
+create index if not exists certificate_private_access_recipient_email_idx on public.certificate_private_access (recipient_email);
+create index if not exists certificate_private_access_issuer_wallet_idx on public.certificate_private_access (issuer_wallet);
 create index if not exists refresh_tokens_user_idx on public.refresh_tokens (user_id);
 create index if not exists refresh_tokens_hash_idx on public.refresh_tokens (token_hash);
 create index if not exists password_reset_tokens_user_idx on public.password_reset_tokens (user_id);
@@ -179,6 +199,7 @@ alter table public.institutions enable row level security;
 alter table public.institution_users enable row level security;
 alter table public.invitations enable row level security;
 alter table public.wallet_bindings enable row level security;
+alter table public.certificate_private_access enable row level security;
 alter table public.refresh_tokens enable row level security;
 alter table public.password_reset_tokens enable row level security;
 alter table public.authorization_requests enable row level security;
@@ -200,6 +221,9 @@ begin
   end if;
   if not exists (select 1 from pg_policies where schemaname='public' and tablename='wallet_bindings' and policyname='wallet_bindings_service_role_all') then
     create policy wallet_bindings_service_role_all on public.wallet_bindings for all using (auth.role() = 'service_role') with check (auth.role() = 'service_role');
+  end if;
+  if not exists (select 1 from pg_policies where schemaname='public' and tablename='certificate_private_access' and policyname='certificate_private_access_service_role_all') then
+    create policy certificate_private_access_service_role_all on public.certificate_private_access for all using (auth.role() = 'service_role') with check (auth.role() = 'service_role');
   end if;
   if not exists (select 1 from pg_policies where schemaname='public' and tablename='refresh_tokens' and policyname='refresh_tokens_service_role_all') then
     create policy refresh_tokens_service_role_all on public.refresh_tokens for all using (auth.role() = 'service_role') with check (auth.role() = 'service_role');
