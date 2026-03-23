@@ -29,6 +29,7 @@ import {
   sha256Hex,
   sha256Hex0x,
 } from "./ipfs-client.js";
+import { bytesForIntegrityCheck, shouldSimulateTamper } from "./demo-tamper.js";
 import { embedVerificationMetadataInPdf } from "./pdf-verification.js";
 import {
   institutionPinGuard,
@@ -187,6 +188,21 @@ type CertificateIndexEntry = {
   revokeTxHash: string | null;
   issueBlockNumber: number;
   revokeBlockNumber: number | null;
+};
+
+type VerificationLookup = {
+  certId: string;
+  metadataCid: string;
+  fileCid: string;
+  onChainHash: string;
+  issuer: string;
+  version: number;
+  replacesCertId: string;
+  issuedAt: number;
+  revoked: boolean;
+  issueTxHash: string;
+  revokeTxHash: string | null;
+  verificationSource: "chain" | "index";
 };
 
 type IssuerStatusEntry = {
@@ -501,6 +517,81 @@ function canonicalizeDemoCertId(certId: string): string {
 
 function isEventLog(log: unknown): log is EventLog {
   return Boolean(log && typeof log === "object" && "args" in (log as Record<string, unknown>));
+}
+
+async function resolveVerificationLookup(certIdInput: string): Promise<VerificationLookup> {
+  const requestedCertId = normalizeCertId(certIdInput);
+  if (!requestedCertId) {
+    throw new Error("certId is required");
+  }
+
+  const certIdCandidates = Array.from(new Set([requestedCertId, canonicalizeDemoCertId(requestedCertId)]));
+  const provider = new JsonRpcProvider(resolveRpcUrl());
+  const contract = new Contract(loadDeploymentAddress(), CERTIFICATE_REGISTRY_ABI, provider);
+
+  let lastErr: unknown = null;
+  for (const candidate of certIdCandidates) {
+    try {
+      const tuple = (await contract.getFunction("getCertificate").staticCall(candidate)) as [
+        string,
+        string,
+        string,
+        string,
+        bigint,
+        string,
+        bigint,
+        boolean,
+        boolean,
+      ];
+      if (!tuple[8]) {
+        continue;
+      }
+      return {
+        certId: candidate,
+        metadataCid: String(tuple[0] || ""),
+        fileCid: String(tuple[1] || ""),
+        onChainHash: String(tuple[2] || ""),
+        issuer: String(tuple[3] || ""),
+        version: Number(tuple[4] || 0),
+        replacesCertId: normalizeCertId(tuple[5]),
+        issuedAt: Number(tuple[6] || 0),
+        revoked: Boolean(tuple[7]),
+        issueTxHash: "",
+        revokeTxHash: null,
+        verificationSource: "chain",
+      };
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+
+  if (lastErr && !isCertificateNotFoundError(lastErr)) {
+    throw lastErr;
+  }
+
+  await ensureCertificateIndexFresh();
+  for (const candidate of certIdCandidates) {
+    const indexed = certificateIndexCache.get(candidate);
+    if (!indexed) {
+      continue;
+    }
+    return {
+      certId: indexed.certId,
+      metadataCid: String(indexed.metadataCid || indexed.cid || ""),
+      fileCid: String(indexed.fileCid || ""),
+      onChainHash: String(indexed.fileHash || ""),
+      issuer: String(indexed.issuer || ""),
+      version: Number(indexed.version || 0),
+      replacesCertId: normalizeCertId(indexed.replacesCertId),
+      issuedAt: Number(indexed.issuedAt || 0),
+      revoked: Boolean(indexed.revoked),
+      issueTxHash: indexed.issueTxHash || "",
+      revokeTxHash: indexed.revokeTxHash || null,
+      verificationSource: "index",
+    };
+  }
+
+  throw new Error("Certificate not found");
 }
 
 function toCertificateRow(entry: CertificateIndexEntry): CertificateRow {
@@ -2306,51 +2397,19 @@ app.get("/api/verify/:certId", verifyRateLimiter, async (req, res) => {
   try {
     const requestedCertId = normalizeCertId(toSingleString(req.params.certId));
     if (!requestedCertId) return res.status(400).json({ error: "certId is required" });
-    const certIdCandidates = Array.from(
-      new Set([requestedCertId, canonicalizeDemoCertId(requestedCertId)])
-    );
-
-    const rpcUrl = resolveRpcUrl();
-    const contractAddress = loadDeploymentAddress();
-    const provider = new JsonRpcProvider(rpcUrl);
-    const contract = new Contract(contractAddress, CERTIFICATE_REGISTRY_ABI, provider);
-
-    let certId = requestedCertId;
-    let chainTuple:
-      | [string, string, string, string, bigint, string, bigint, boolean, boolean]
-      | null = null;
-    let lastErr: unknown = null;
-    for (const candidate of certIdCandidates) {
-      try {
-        chainTuple = (await contract.getFunction("getCertificate").staticCall(candidate)) as [
-          string,
-          string,
-          string,
-          string,
-          bigint,
-          string,
-          bigint,
-          boolean,
-          boolean,
-        ];
-        const exists = Boolean(chainTuple[8]);
-        if (!exists) {
-          chainTuple = null;
-          continue;
-        }
-        certId = candidate;
-        break;
-      } catch (err) {
-        lastErr = err;
-      }
-    }
-    if (!chainTuple) {
-      if (lastErr) throw lastErr;
-      return res.status(404).json({ error: "Certificate not found", certId: requestedCertId });
-    }
-
-    const [metadataCid, fileCidOnChain, onChainHash, issuer, version, replacesCertIdRaw, issuedAt, revoked] = chainTuple;
-    const replacesCertId = normalizeCertId(replacesCertIdRaw);
+    const lookup = await resolveVerificationLookup(requestedCertId);
+    const {
+      certId,
+      metadataCid,
+      fileCid,
+      onChainHash,
+      issuer,
+      version,
+      replacesCertId,
+      issuedAt,
+      revoked,
+      verificationSource,
+    } = lookup;
     metadataCidForError = metadataCid;
     if (!String(metadataCid || "").trim()) {
       return res.status(422).json({
@@ -2367,7 +2426,7 @@ app.get("/api/verify/:certId", verifyRateLimiter, async (req, res) => {
         : rawMetadataFileHash;
     const storageMode = String(metadata?.storageMode || "encrypted-blob").trim() || "encrypted-blob";
     const encryptionAlg = String(metadata?.encryptionAlg || "aes-256-gcm").trim() || "aes-256-gcm";
-    const resolvedFileCid = String(fileCidOnChain || "").trim();
+    const resolvedFileCid = String(fileCid || "").trim();
 
     if (!resolvedFileCid) {
       return res.status(422).json({
@@ -2377,7 +2436,7 @@ app.get("/api/verify/:certId", verifyRateLimiter, async (req, res) => {
       });
     }
 
-    const fileBytes = await fetchCidBytes(resolvedFileCid);
+    const fileBytes = bytesForIntegrityCheck(certId, await fetchCidBytes(resolvedFileCid));
     const computedHash = sha256Hex0x(fileBytes);
     const integrityMatch = computedHash.toLowerCase() === String(onChainHash).toLowerCase();
     const metadataHashMatch = metadataFileHash ? metadataFileHash === computedHash.toLowerCase() : null;
@@ -2398,6 +2457,8 @@ app.get("/api/verify/:certId", verifyRateLimiter, async (req, res) => {
       computedHash,
       integrityMatch,
       metadataHashMatch,
+      demoTampered: shouldSimulateTamper(certId),
+      verificationSource,
       status: integrityMatch && !revoked ? "VALID" : revoked ? "REVOKED" : "TAMPERED",
     });
   } catch (err: any) {
@@ -2437,6 +2498,7 @@ async function buildVerificationProof(certIdInput: string): Promise<{
   certId: string;
   status: "VALID" | "REVOKED" | "TAMPERED";
   verifiedAtIso: string;
+  verificationSource: "chain" | "index";
   txHash: string;
   revokeTxHash: string | null;
   metadataCid: string;
@@ -2458,40 +2520,20 @@ async function buildVerificationProof(certIdInput: string): Promise<{
     throw new Error("certId is required");
   }
 
-  const certIdCandidates = Array.from(new Set([requestedCertId, canonicalizeDemoCertId(requestedCertId)]));
-  const provider = new JsonRpcProvider(resolveRpcUrl());
-  const contract = new Contract(loadDeploymentAddress(), CERTIFICATE_REGISTRY_ABI, provider);
-  let certId = requestedCertId;
-  let chainTuple:
-    | [string, string, string, string, bigint, string, bigint, boolean, boolean]
-    | null = null;
-  for (const candidate of certIdCandidates) {
-    try {
-      const tuple = (await contract.getFunction("getCertificate").staticCall(candidate)) as [
-        string,
-        string,
-        string,
-        string,
-        bigint,
-        string,
-        bigint,
-        boolean,
-        boolean,
-      ];
-      if (!tuple[8]) continue;
-      certId = candidate;
-      chainTuple = tuple;
-      break;
-    } catch {
-      // Try next candidate.
-    }
-  }
-  if (!chainTuple) {
-    throw new Error("Certificate not found");
-  }
-
-  const [metadataCid, fileCidOnChain, onChainHash, issuer, version, replacesCertIdRaw, issuedAt, revoked] = chainTuple;
-  const replacesCertId = normalizeCertId(replacesCertIdRaw);
+  const {
+    certId,
+    metadataCid,
+    fileCid,
+    onChainHash,
+    issuer,
+    version,
+    replacesCertId,
+    issuedAt,
+    revoked,
+    issueTxHash,
+    revokeTxHash,
+    verificationSource,
+  } = await resolveVerificationLookup(requestedCertId);
   if (!String(metadataCid || "").trim()) {
     throw new Error("Certificate metadata CID is missing on-chain");
   }
@@ -2503,11 +2545,11 @@ async function buildVerificationProof(certIdInput: string): Promise<{
       : rawMetadataFileHash || null;
   const storageMode = String(metadata?.storageMode || "encrypted-blob").trim() || "encrypted-blob";
   const encryptionAlg = String(metadata?.encryptionAlg || "aes-256-gcm").trim() || "aes-256-gcm";
-  const resolvedFileCid = String(fileCidOnChain || "").trim();
+  const resolvedFileCid = String(fileCid || "").trim();
   if (!resolvedFileCid) {
     throw new Error("Metadata missing fileCid and no on-chain fileCid available");
   }
-  const fileBytes = await fetchCidBytes(resolvedFileCid);
+  const fileBytes = bytesForIntegrityCheck(certId, await fetchCidBytes(resolvedFileCid));
   const computedHash = sha256Hex0x(fileBytes);
   const integrityMatch = computedHash.toLowerCase() === String(onChainHash).toLowerCase();
   const metadataHashMatch = metadataFileHash ? metadataFileHash === computedHash.toLowerCase() : null;
@@ -2521,8 +2563,9 @@ async function buildVerificationProof(certIdInput: string): Promise<{
     certId,
     status,
     verifiedAtIso: new Date().toISOString(),
-    txHash: String(historyEntry?.issueTxHash || ""),
-    revokeTxHash: historyEntry?.revokeTxHash || null,
+    verificationSource,
+    txHash: String(historyEntry?.issueTxHash || issueTxHash || ""),
+    revokeTxHash: historyEntry?.revokeTxHash || revokeTxHash || null,
     metadataCid: String(metadataCid || ""),
     storageMode,
     encryptionAlg,
@@ -2573,6 +2616,7 @@ app.get("/api/proof/:certId.pdf", async (req, res) => {
     const lines: Array<[string, string]> = [
       ["Status", proof.status],
       ["certId", proof.certId],
+      ["verificationSource", proof.verificationSource],
       ["Issuer", proof.issuer],
       ["storageMode", proof.storageMode],
       ["encryptionAlg", proof.encryptionAlg],

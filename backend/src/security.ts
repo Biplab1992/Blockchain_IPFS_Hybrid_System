@@ -21,6 +21,7 @@ import {
   decryptPinnedFileWithKey,
 } from "./file-envelope.js";
 import { fetchCidBytes, sha256Hex0x } from "./ipfs-client.js";
+import { bytesForIntegrityCheck } from "./demo-tamper.js";
 
 type LogLevel = "info" | "warn" | "error";
 
@@ -1565,7 +1566,7 @@ export function registerSecurityRoutes(app: express.Express, authLimiter: expres
         }
       }
 
-      const encryptedBytes = await fetchCidBytes(resolvedFileCid);
+      const encryptedBytes = bytesForIntegrityCheck(certId, await fetchCidBytes(resolvedFileCid));
       const computedHash = sha256Hex0x(encryptedBytes);
       if (computedHash.toLowerCase() !== String(onChainHash || "").toLowerCase()) {
         return res.status(409).json({

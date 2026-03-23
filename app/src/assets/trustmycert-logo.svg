@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 72 72" role="img" aria-label="TrustMyCert logo">
+  <defs>
+    <linearGradient id="trustmycertLogoGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00a7c7" />
+      <stop offset="100%" stop-color="#1f2b57" />
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="56" height="56" rx="16" fill="url(#trustmycertLogoGradient)" />
+  <circle cx="24" cy="24" r="5" fill="#ffffff" />
+  <circle cx="48" cy="24" r="5" fill="#ffffff" />
+  <circle cx="24" cy="48" r="5" fill="#ffffff" />
+  <circle cx="48" cy="48" r="5" fill="#ffffff" />
+  <path d="M24 24H48M24 24V48M48 24V48M24 48H48" stroke="#ffffff" stroke-width="3" />
+  <rect x="31" y="31" width="10" height="10" rx="2" fill="#ffffff" />
+</svg>
